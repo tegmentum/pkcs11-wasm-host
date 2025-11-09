@@ -15,6 +15,3 @@ Cargo.lock
 # Temporary files
 *.tmp
 last_command.txt
-
-# WIT definitions (managed as submodule or symlink)
-wit/
