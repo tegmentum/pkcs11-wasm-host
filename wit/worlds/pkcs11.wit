@@ -1,0 +1,24 @@
+package pkcs11:host;
+
+use pkcs11:crypto/crypto;
+use pkcs11:object/object;
+use pkcs11:registry/provider-registry;
+use pkcs11:session/session;
+use pkcs11:token/slot-manager;
+
+world pkcs11 {
+  /// Expose the slot manager interface to guests.
+  export slot-manager;
+
+  /// Provide a registry so hosts can publish provider metadata to guests.
+  export provider-registry;
+
+  /// Surface session management operations and associated resources.
+  export session;
+
+  /// Allow callers to manipulate token objects and search cursors.
+  export object;
+
+  /// Stream cryptographic primitives such as encrypt, sign, and digest.
+  export crypto;
+}

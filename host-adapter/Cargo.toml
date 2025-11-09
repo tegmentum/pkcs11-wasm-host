@@ -1,0 +1,17 @@
+[package]
+name = "pkcs11-host-adapter"
+version = "0.0.1"
+edition = "2021"
+authors = ["PKCS11 WIT Team"]
+description = "Host adapter prototype for the PKCS#11 WIT component world"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+libloading = "0.8"
+thiserror = "1"
+wasmtime = { version = "18", features = ["component-model", "async"] }
+wit-bindgen = "0.46"
+zeroize = "1"
+parking_lot = "0.12"
+log = "0.4"

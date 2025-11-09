@@ -1,0 +1,235 @@
+package pkcs11:core;
+
+interface core {
+  use pkcs11:buffer/buffer.{bytes};
+
+  /// PKCS#11 version value commonly used in slot/token metadata.
+  record version {
+    major: u8,
+    minor: u8,
+  }
+
+  /// Metadata returned by `C_GetInfo` describing the loaded module.
+  record module-info {
+    cryptoki-version: version,
+    manufacturer-id: string,
+    module-flags: u64,
+    library-description: string,
+    library-version: version,
+  }
+
+  /// All PKCS#11 calls return an error code. `ok` represents CKR_OK.
+  variant error-code {
+    ok,
+    general-error,
+    host-memory,
+    slot-id-invalid,
+    token-not-present,
+    token-not-recognized,
+    token-write-protected,
+    session-handle-invalid,
+    session-closed,
+    session-count,
+    session-parallel-not-supported,
+    session-read-only,
+    session-read-only-exists,
+    session-read-write-so-needed,
+    pin-incorrect,
+    pin-locked,
+    pin-expired,
+    user-not-logged-in,
+    user-already-logged-in,
+    key-handle-invalid,
+    key-function-not-permitted,
+    key-size-range,
+    key-type-inconsistent,
+    mechanism-invalid,
+    mechanism-param-invalid,
+    operation-not-initialized,
+    operation-active,
+    attribute-read-only,
+    attribute-sensitive,
+    attribute-type-invalid,
+    attribute-value-invalid,
+    template-incomplete,
+    template-inconsistent,
+    buffer-too-small,
+    device-error,
+    device-removed,
+    function-canceled,
+    function-failed,
+    not-initialized,
+    need-to-create-thread,
+    cannot-lock,
+    rng-not-seeded,
+    rng-not-supported,
+    vendor(u32),
+    unknown(u32),
+  }
+
+  /// Slot identifier mirrors CK_SLOT_ID.
+  type slot-id = u32;
+
+  /// Session handle mirrors CK_SESSION_HANDLE.
+  type session-handle = u32;
+
+  /// Object handle mirrors CK_OBJECT_HANDLE.
+  type object-handle = u32;
+
+  /// Mechanism identifiers mirror CK_MECHANISM_TYPE.
+  type mechanism-type = u64;
+
+  /// Key classes as defined by CK_OBJECT_CLASS.
+  type object-class = u32;
+
+  /// Key types as defined by CK_KEY_TYPE.
+  type key-type = u32;
+
+  /// Attribute tags map to CK_ATTRIBUTE_TYPE values.
+  type attribute-tag = u32;
+
+  /// PKCS#11 session flags.
+  flags session-flags {
+    rw-session,
+    serial-session,
+  }
+
+  /// Slot capability flags.
+  flags slot-flags {
+    token-present,
+    removable-device,
+    hw-slot,
+  }
+
+  /// Token capability flags.
+  flags token-flags {
+    rng,
+    write-protected,
+    login-required,
+    user-pin-initialized,
+    restore-key-not-needed,
+    clock-on-token,
+    protected-authentication-path,
+    dual-crypto-operations,
+    token-initialized,
+    secondary-authentication,
+    user-pin-count-low,
+    user-pin-final-try,
+    user-pin-locked,
+    user-pin-to-be-changed,
+    so-pin-count-low,
+    so-pin-final-try,
+    so-pin-locked,
+    so-pin-to-be-changed,
+    error-state,
+  }
+
+  /// Mechanism capability flags.
+  flags mechanism-flags {
+    hw,
+    encrypt,
+    decrypt,
+    digest,
+    sign,
+    sign-recover,
+    verify,
+    verify-recover,
+    generate,
+    generate-key-pair,
+    wrap,
+    unwrap,
+    derive,
+    extension,
+  }
+
+  /// Session state values mirror CK_STATE.
+  enum session-state {
+    ro-public-session,
+    ro-user-functions,
+    rw-public-session,
+    rw-user-functions,
+    rw-so-functions,
+  }
+
+  /// User types used for login/logout flows.
+  enum user-type {
+    so,
+    user,
+    context-specific,
+  }
+
+  /// Vendor-specific user types can be represented via numeric identifier.
+  type vendor-user-type = u32;
+
+  /// Slot metadata returned by slot discovery APIs.
+  record slot-info {
+    slot-description: string,
+    manufacturer-id: string,
+    slot-flags: slot-flags,
+    hardware-version: version,
+    firmware-version: version,
+  }
+
+  /// Token metadata returned when opening a slot.
+  record token-info {
+    label: string,
+    manufacturer-id: string,
+    model: string,
+    serial-number: string,
+    token-flags: token-flags,
+    max-session-count: u64,
+    session-count: u64,
+    max-rw-session-count: u64,
+    rw-session-count: u64,
+    max-pin-len: u64,
+    min-pin-len: u64,
+    total-public-memory: option<u64>,
+    free-public-memory: option<u64>,
+    total-private-memory: option<u64>,
+    free-private-memory: option<u64>,
+    hardware-version: version,
+    firmware-version: version,
+    utc-time: option<string>,
+  }
+
+  /// Mechanism metadata describing allowable operations and key lengths.
+  record mechanism-info {
+    min-key-size: u64,
+    max-key-size: u64,
+    mechanism-flags: mechanism-flags,
+  }
+
+  /// Provides a typed view over boolean PKCS#11 attributes.
+  variant attribute-value {
+    boolean(bool),
+    uint32(u32),
+    uint64(u64),
+    byte-string(bytes),
+    date-string(string),
+    mechanism-type(mechanism-type),
+    key-kind(key-type),
+    object-kind(object-class),
+    vendor-bytes(bytes),
+  }
+
+  /// Attribute template entry used for create/copy/find/search.
+  record attribute {
+    tag: attribute-tag,
+    value: attribute-value,
+  }
+
+  /// Collection of attributes represented as a simple list.
+  type attribute-template = list<attribute>;
+
+  /// Mechanism request combines type with optional parameters serialized elsewhere.
+  record mechanism {
+    kind: mechanism-type,
+    parameter: option<bytes>,
+  }
+
+  /// Utility result type for operations with optional output data.
+  record output-buffer {
+    data: bytes,
+    truncated: bool,
+  }
+}

@@ -1,0 +1,119 @@
+package pkcs11:crypto;
+
+interface crypto {
+  use pkcs11:buffer/buffer.{bytes, chunk};
+  use pkcs11:core/core.{error-code, mechanism, mechanism-type, object-handle};
+
+  /// RSA-OAEP mechanism parameters.
+  record rsa-oaep-param {
+    hash: mechanism-type,
+    mgf: mechanism-type,
+    source: mechanism-type,
+    source-data: option<bytes>,
+  }
+
+  /// RSA-PSS mechanism parameters.
+  record rsa-pss-param {
+    hash: mechanism-type,
+    mgf: mechanism-type,
+    salt-length: u32,
+  }
+
+  /// CK_AES_GCM_PARAMS analogue.
+  record aes-gcm-param {
+    iv: bytes,
+    aad: bytes,
+    tag-bits: u32,
+  }
+
+  /// CK_AES_CCM_PARAMS analogue.
+  record aes-ccm-param {
+    nonce: bytes,
+    aad: bytes,
+    data-length: u32,
+    mac-length: u32,
+  }
+
+  /// ChaCha20-Poly1305 parameters.
+  record chacha20-poly1305-param {
+    nonce: bytes,
+    aad: bytes,
+    tag-length: u32,
+  }
+
+  /// HKDF extract/expand mode selection.
+  enum hkdf-mode {
+    extract-and-expand,
+    extract,
+    expand,
+  }
+
+  /// HKDF mechanism parameters.
+  record hkdf-param {
+    mode: hkdf-mode,
+    hash: mechanism-type,
+    salt: option<bytes>,
+    info: option<bytes>,
+  }
+
+  /// TLS PRF parameters (legacy and TLS 1.2 share the same structure with different mechanism tags).
+  record tls-prf-param {
+    label: string,
+    seed: bytes,
+    output-length: u32,
+  }
+
+  /// Union of strongly typed mechanism parameter payloads.
+  variant mechanism-parameter {
+    empty,
+    rsa-oaep(rsa-oaep-param),
+    rsa-pss(rsa-pss-param),
+    aes-gcm(aes-gcm-param),
+    aes-ccm(aes-ccm-param),
+    chacha20-poly1305(chacha20-poly1305-param),
+    hkdf(hkdf-param),
+    tls-prf(tls-prf-param),
+    raw(bytes),
+  }
+
+  /// Streaming encrypt operation handle.
+  resource encryptor {
+    update: func(part: chunk) -> result<bytes, error-code>;
+    final: func(max-size: u32) -> result<bytes, error-code>;
+    abort: func() -> result<_, error-code>;
+  }
+
+  /// Streaming decrypt operation handle.
+  resource decryptor {
+    update: func(part: chunk) -> result<bytes, error-code>;
+    final: func(max-size: u32) -> result<bytes, error-code>;
+    abort: func() -> result<_, error-code>;
+  }
+
+  /// Streaming signature generation handle.
+  resource signer {
+    update: func(part: chunk) -> result<_, error-code>;
+    final: func() -> result<bytes, error-code>;
+    abort: func() -> result<_, error-code>;
+  }
+
+  /// Streaming signature verification handle.
+  resource verifier {
+    update: func(part: chunk) -> result<_, error-code>;
+    final: func(signature: bytes) -> result<_, error-code>;
+    abort: func() -> result<_, error-code>;
+  }
+
+  /// Streaming digest handle.
+  resource digester {
+    update: func(part: chunk) -> result<_, error-code>;
+    final: func() -> result<bytes, error-code>;
+    abort: func() -> result<_, error-code>;
+  }
+
+  /// Result from a key derivation flow.
+  record derived-key {
+    base: object-handle,
+    mechanism: mechanism,
+  }
+}

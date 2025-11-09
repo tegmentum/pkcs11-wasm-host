@@ -1,0 +1,13 @@
+package wasm-pkcs11:guestsmoke;
+
+use pkcs11:token/slot-manager;
+use pkcs11:session/session;
+use pkcs11:object/object;
+
+world guestsmoke {
+  import pkcs11:token/slot-manager;
+  import pkcs11:session/session;
+  import pkcs11:object/object;
+
+  export run: func() -> result<_, string>;
+}
