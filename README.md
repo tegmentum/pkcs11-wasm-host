@@ -77,14 +77,48 @@ cargo test
 
 ## Usage
 
+### With Wasmtime CLI Host Bundles
+
+The adapter can be packaged as a wasmtime host bundle for easy distribution:
+
+```bash
+# Build host bundle
+cd host-adapter
+cargo build --release
+
+# Run component with PKCS#11
+wasmtime component run \
+  --host-bundle ./pkcs11_host_bundle \
+  --env PKCS11_MODULE_PATH=/usr/local/lib/softhsm/libsofthsm2.so \
+  your_component.wasm
+```
+
+See [WASMTIME_INTEGRATION.md](WASMTIME_INTEGRATION.md) for complete integration guide.
+
+### Programmatic Usage
+
 ```rust
-use pkcs11_host_adapter::SlotManagerImpl;
+use pkcs11_host_adapter::AdapterContext;
 
 // Initialize with a PKCS#11 provider
-SlotManagerImpl::initialize("module=/usr/local/lib/softhsm/libsofthsm2.so")?;
+let ctx = AdapterContext::default();
+ctx.ensure_initialized("/usr/local/lib/softhsm/libsofthsm2.so")?;
 
 // Use the PKCS#11 interface through WebAssembly components
 ```
+
+## Integration
+
+This adapter is designed to work with:
+- **Wasmtime CLI**: Via host bundles (see [WASMTIME_INTEGRATION.md](WASMTIME_INTEGRATION.md))
+- **Custom Runtimes**: Link directly as a Rust library
+- **Component Orchestration**: Compatible with webassembly-component-orchestration patterns
+
+## Related Projects
+
+- **wasmtime**: WebAssembly runtime with component model support
+- **pkcs11-wit**: WIT interface definitions (submodule)
+- **webassembly-component-orchestration**: Component composition system
 
 ## License
 
