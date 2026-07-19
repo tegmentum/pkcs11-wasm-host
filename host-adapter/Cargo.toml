@@ -10,7 +10,7 @@ license = "Apache-2.0"
 anyhow = "1"
 libloading = "0.8"
 thiserror = "1"
-wasmtime = { version = "45.0.1", features = ["component-model", "async"] }
+wasmtime = { version = "46.0.1", features = ["component-model", "async"] }
 wit-bindgen = "0.46"
 zeroize = "1"
 parking_lot = "0.12"
