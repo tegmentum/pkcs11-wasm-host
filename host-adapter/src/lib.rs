@@ -5525,7 +5525,7 @@ mod tests {
                         inner.ctx.sign_recover(
                             inner.handle,
                             &rsa_mechanism,
-                            private_host.handle(),
+                            private_host.get_handle(),
                             &recover_payload,
                             4096,
                         )
@@ -5546,7 +5546,7 @@ mod tests {
                         inner.ctx.verify_recover(
                             inner.handle,
                             &rsa_mechanism,
-                            public_host.handle(),
+                            public_host.get_handle(),
                             &recovered.data,
                             4096,
                         )
@@ -5573,7 +5573,7 @@ mod tests {
                 map_code(
                     "session.digest_key",
                     session_host.with_inner(|inner| {
-                        inner.ctx.digest_key(inner.handle, private_host.handle())
+                        inner.ctx.digest_key(inner.handle, private_host.get_handle())
                     }),
                 )?;
                 let digest = map_code("digester.final", digester_host.final_())?;
