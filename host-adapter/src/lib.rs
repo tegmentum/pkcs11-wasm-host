@@ -1,14 +1,16 @@
 //! Prototype host adapter wiring the `pkcs11:world/pkcs11` WIT world into a Rust environment.
 
 use std::collections::HashMap;
+use std::env;
 use std::ffi::c_void;
-use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use libloading;
-use parking_lot::Mutex;
+use log::info;
+use parking_lot::lock_api::RawMutex as _;
+use parking_lot::{Mutex, RawMutex};
 use zeroize::Zeroizing;
 
 /// Re-export generated bindings once `wit-bindgen` has run.
@@ -30,6 +32,9 @@ pub mod bindings {
     });
 }
 
+mod loader;
+
+use crate::loader::{FilesystemLoader, LoaderError, ModuleConfig, ModuleLoader, MutexPreference};
 use bindings::exports::pkcs11::crypto::crypto as crypto_iface;
 use bindings::exports::pkcs11::object::object as object_iface;
 use bindings::exports::pkcs11::object::object::GuestObject;
@@ -38,25 +43,64 @@ use bindings::exports::pkcs11::session::session as session_iface;
 use bindings::exports::pkcs11::token::slot_manager;
 use bindings::pkcs11::buffer::buffer::Chunk;
 use bindings::pkcs11::core::core::{
-    Attribute as WitAttribute, AttributeTemplate, AttributeValue, ErrorCode, Mechanism,
-    MechanismFlags, MechanismInfo, MechanismType, ModuleInfo, ObjectHandle, OutputBuffer,
-    SessionFlags as WitSessionFlags, SessionState as WitSessionState, SlotFlags, SlotInfo,
-    TokenFlags, TokenInfo, UserType, VendorUserType, Version,
+    Attribute as WitAttribute, AttributePayload, AttributeTemplate, AttributeValue, ErrorCode,
+    Mechanism, MechanismFlags, MechanismInfo, MechanismType, ModuleInfo, ObjectHandle,
+    OutputBuffer, SessionFlags as WitSessionFlags, SessionState as WitSessionState, SlotFlags,
+    SlotInfo, TokenFlags, TokenInfo, UserType, VendorUserType, Version,
 };
 use bindings::pkcs11::util::util::Credential as WitCredential;
 
 /// Shared context for the adapter. Holds global PKCS#11 module state.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AdapterContext {
     inner: Arc<Mutex<NativePkcs11>>, // Native bindings and module handles
 }
 
+#[derive(Clone, Debug)]
+pub struct AdapterConfigSummary {
+    pub module_path: String,
+    pub mutex_preference: MutexPreference,
+    pub slot_filter: Option<u32>,
+}
+
+impl AdapterConfigSummary {
+    fn from_loader(config: &ModuleConfig, preferred_slot: Option<u32>) -> Self {
+        Self {
+            module_path: config.module_path.display().to_string(),
+            mutex_preference: config.mutex_preference,
+            slot_filter: preferred_slot,
+        }
+    }
+}
+
 impl AdapterContext {
+    fn new() -> Self {
+        let loader: Arc<dyn ModuleLoader> = Arc::new(FilesystemLoader::default());
+        Self {
+            inner: Arc::new(Mutex::new(NativePkcs11::new(loader))),
+        }
+    }
+
+    pub fn current_config(&self) -> Option<String> {
+        self.inner.lock().current_config()
+    }
+
+    pub fn config_summary(&self) -> Option<AdapterConfigSummary> {
+        self.inner.lock().config_summary()
+    }
+
     /// Guarantee the module is loaded and `C_Initialize` has been called.
-    pub fn ensure_initialized(&self, module_path: &str) -> Result<(), ErrorCode> {
+    pub fn ensure_initialized(&self, config: &str) -> Result<(), ErrorCode> {
         let mut guard = self.inner.lock();
-        guard.load_module(Path::new(module_path))?;
-        guard.initialize()
+        guard.load_module(config)?;
+        guard.initialize()?;
+        if let Some(summary) = guard.config_summary() {
+            info!(
+                "pkcs11 module initialized: path={} mutex={:?} slot_filter={:?}",
+                summary.module_path, summary.mutex_preference, summary.slot_filter
+            );
+        }
+        Ok(())
     }
 
     /// Finalize the module if it has been initialized.
@@ -69,6 +113,28 @@ impl AdapterContext {
     pub fn slot_list(&self, token_present: bool) -> Result<Vec<u32>, ErrorCode> {
         let guard = self.inner.lock();
         guard.get_slot_list(token_present)
+    }
+
+    /// Fetch any serialized operation state.
+    pub fn get_operation_state(
+        &self,
+        handle: u32,
+        max_size: u32,
+    ) -> Result<OutputBuffer, ErrorCode> {
+        let guard = self.inner.lock();
+        guard.get_operation_state(handle, max_size)
+    }
+
+    /// Restore a serialized operation state.
+    pub fn set_operation_state(
+        &self,
+        handle: u32,
+        state: &[u8],
+        encryption_key: Option<u32>,
+        auth_key: Option<u32>,
+    ) -> Result<(), ErrorCode> {
+        let mut guard = self.inner.lock();
+        guard.set_operation_state(handle, state, encryption_key, auth_key)
     }
 
     /// Fetch module metadata exposed via `C_GetInfo`.
@@ -87,6 +153,15 @@ impl AdapterContext {
     pub fn token_info(&self, slot: u32) -> Result<TokenInfo, ErrorCode> {
         let guard = self.inner.lock();
         guard.get_token_info(slot)
+    }
+
+    /// Wait for a slot insertion/removal event.
+    pub fn wait_for_slot_event(
+        &self,
+        flags: slot_manager::WaitFlags,
+    ) -> Result<slot_manager::SlotEvent, ErrorCode> {
+        let mut guard = self.inner.lock();
+        guard.wait_for_slot_event(flags)
     }
 
     /// Fetch the list of supported mechanisms for a slot.
@@ -112,8 +187,9 @@ impl AdapterContext {
         so_pin: Option<String>,
         label: String,
     ) -> Result<(), ErrorCode> {
+        let pin = so_pin.map(|pin| Zeroizing::new(pin.into_bytes()));
         let mut guard = self.inner.lock();
-        guard.init_token(slot, so_pin, label)
+        guard.init_token(slot, pin.as_ref().map(|p| p.as_slice()), label)
     }
 
     /// Close all open sessions for a slot.
@@ -126,6 +202,35 @@ impl AdapterContext {
     pub fn open_session(&self, slot: u32, flags: WitSessionFlags) -> Result<u32, ErrorCode> {
         let mut guard = self.inner.lock();
         guard.open_session(slot, flags)
+    }
+
+    pub fn sign_recover(
+        &self,
+        handle: u32,
+        mechanism: &Mechanism,
+        key: u32,
+        data: &[u8],
+        out_max: u32,
+    ) -> Result<OutputBuffer, ErrorCode> {
+        let mut guard = self.inner.lock();
+        guard.sign_recover(handle, mechanism, key, data, out_max)
+    }
+
+    pub fn verify_recover(
+        &self,
+        handle: u32,
+        mechanism: &Mechanism,
+        key: u32,
+        signature: &[u8],
+        out_max: u32,
+    ) -> Result<OutputBuffer, ErrorCode> {
+        let mut guard = self.inner.lock();
+        guard.verify_recover(handle, mechanism, key, signature, out_max)
+    }
+
+    pub fn digest_key(&self, handle: u32, key: u32) -> Result<(), ErrorCode> {
+        let mut guard = self.inner.lock();
+        guard.digest_key(handle, key)
     }
 
     /// Close an individual session.
@@ -233,6 +338,61 @@ impl AdapterContext {
         guard.get_attributes(handle, object, tags)
     }
 
+    pub fn generate_key(
+        &self,
+        handle: u32,
+        mechanism: &Mechanism,
+        template: &[WitAttribute],
+    ) -> Result<u32, ErrorCode> {
+        let mut guard = self.inner.lock();
+        guard.generate_key(handle, mechanism, template)
+    }
+
+    pub fn generate_key_pair(
+        &self,
+        handle: u32,
+        mechanism: &Mechanism,
+        public_template: &[WitAttribute],
+        private_template: &[WitAttribute],
+    ) -> Result<(u32, u32), ErrorCode> {
+        let mut guard = self.inner.lock();
+        guard.generate_key_pair(handle, mechanism, public_template, private_template)
+    }
+
+    pub fn derive_key(
+        &self,
+        handle: u32,
+        base_key: u32,
+        mechanism: &Mechanism,
+        template: &[WitAttribute],
+    ) -> Result<u32, ErrorCode> {
+        let mut guard = self.inner.lock();
+        guard.derive_key(handle, base_key, mechanism, template)
+    }
+
+    pub fn wrap_key(
+        &self,
+        handle: u32,
+        mechanism: &Mechanism,
+        wrapping_key: u32,
+        key: u32,
+    ) -> Result<Vec<u8>, ErrorCode> {
+        let guard = self.inner.lock();
+        guard.wrap_key(handle, mechanism, wrapping_key, key)
+    }
+
+    pub fn unwrap_key(
+        &self,
+        handle: u32,
+        mechanism: &Mechanism,
+        wrapping_key: u32,
+        wrapped_key: &[u8],
+        template: &[WitAttribute],
+    ) -> Result<u32, ErrorCode> {
+        let mut guard = self.inner.lock();
+        guard.unwrap_key(handle, mechanism, wrapping_key, wrapped_key, template)
+    }
+
     /// Begin an object search using the supplied template.
     pub fn find_objects_init(
         &self,
@@ -259,6 +419,12 @@ impl AdapterContext {
 fn adapter() -> AdapterContext {
     static CONTEXT: OnceLock<AdapterContext> = OnceLock::new();
     CONTEXT.get_or_init(AdapterContext::default).clone()
+}
+
+impl Default for AdapterContext {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -607,6 +773,14 @@ fn session_flags_from_ck(flags: ffi::CK_FLAGS) -> WitSessionFlags {
     result
 }
 
+fn wait_flags_to_ck(flags: slot_manager::WaitFlags) -> ffi::CK_FLAGS {
+    let mut result = 0;
+    if flags.contains(slot_manager::WaitFlags::DONT_BLOCK) {
+        result |= ffi::CKF_DONT_BLOCK;
+    }
+    result
+}
+
 fn session_state_from_ck(state: ffi::CK_STATE) -> WitSessionState {
     match state {
         ffi::CKS_RO_PUBLIC_SESSION => WitSessionState::RoPublicSession,
@@ -704,22 +878,44 @@ unsafe fn load_symbol<'lib, T>(
 }
 
 fn attribute_value_to_bytes(value: &AttributeValue) -> Result<Vec<u8>, ErrorCode> {
-    match value {
-        AttributeValue::Boolean(v) => Ok(vec![*v as u8]),
-        AttributeValue::Uint32(v) => Ok(v.to_ne_bytes().to_vec()),
-        AttributeValue::Uint64(v) => Ok(v.to_ne_bytes().to_vec()),
-        AttributeValue::ByteString(v) => Ok(v.clone()),
-        AttributeValue::DateString(date) => Ok(date.as_bytes().to_vec()),
-        AttributeValue::MechanismType(mech) => Ok(mech.to_ne_bytes().to_vec()),
-        AttributeValue::KeyKind(kind) => Ok(kind.to_ne_bytes().to_vec()),
-        AttributeValue::ObjectKind(class) => Ok(class.to_ne_bytes().to_vec()),
-        AttributeValue::VendorBytes(v) => Ok(v.clone()),
+    match &value.payload {
+        AttributePayload::Boolean(v) => Ok(vec![*v as u8]),
+        AttributePayload::Uint32(v) => Ok(v.to_ne_bytes().to_vec()),
+        AttributePayload::Uint64(v) => Ok(v.to_ne_bytes().to_vec()),
+        AttributePayload::ByteString(v) => Ok(v.clone()),
+        AttributePayload::DateString(date) => Ok(date.as_bytes().to_vec()),
+        AttributePayload::MechanismType(mech) => Ok(mech.to_ne_bytes().to_vec()),
+        AttributePayload::KeyKind(kind) => Ok(kind.to_ne_bytes().to_vec()),
+        AttributePayload::ObjectKind(class) => Ok(class.to_ne_bytes().to_vec()),
+        AttributePayload::VendorBytes(v) => Ok(v.clone()),
+    }
+}
+
+#[cfg(test)]
+fn attribute_value_from_payload(payload: AttributePayload) -> AttributeValue {
+    let length_hint = match &payload {
+        AttributePayload::Boolean(_) => Some(1),
+        AttributePayload::Uint32(_) => Some(4),
+        AttributePayload::Uint64(_) => Some(8),
+        AttributePayload::MechanismType(_) => Some(8),
+        AttributePayload::KeyKind(_) => Some(4),
+        AttributePayload::ObjectKind(_) => Some(4),
+        AttributePayload::DateString(s) => Some(s.len() as u64),
+        AttributePayload::ByteString(bytes) => Some(bytes.len() as u64),
+        AttributePayload::VendorBytes(bytes) => Some(bytes.len() as u64),
+    };
+    AttributeValue {
+        payload,
+        length_hint,
+        partial: false,
     }
 }
 
 const CKA_CLASS: u32 = 0x0000_0000;
 const CKA_TOKEN: u32 = 0x0000_0001;
 const CKA_PRIVATE: u32 = 0x0000_0002;
+#[cfg(test)]
+const CKA_LABEL: u32 = 0x0000_0003;
 const CKA_TRUSTED: u32 = 0x0000_0086;
 const CKA_MODULUS_BITS: u32 = 0x0000_0121;
 const CKA_KEY_TYPE: u32 = 0x0000_0100;
@@ -742,26 +938,44 @@ const CKA_COPYABLE: u32 = 0x0000_0171;
 const CKA_DESTROYABLE: u32 = 0x0000_0172;
 const CKA_ALWAYS_AUTHENTICATE: u32 = 0x0000_0202;
 const CKA_VALUE_LEN: u32 = 0x0000_0161;
+#[cfg(test)]
+const CKA_ID: u32 = 0x0000_0102;
+#[cfg(test)]
+const CKA_PUBLIC_EXPONENT: u32 = 0x0000_0122;
+#[cfg(test)]
 const CKA_VALUE: u32 = 0x0000_0011;
+#[cfg(test)]
 const CKO_DATA: u32 = 0x0000_0003;
+#[cfg(test)]
+const CKO_PUBLIC_KEY: u32 = 0x0000_0002;
+#[cfg(test)]
+const CKO_PRIVATE_KEY: u32 = 0x0000_0003;
+#[cfg(test)]
+const CKK_RSA: u32 = 0x0000_0000;
+#[cfg(test)]
+const CKM_RSA_PKCS_KEY_PAIR_GEN: u64 = 0x0000_0000;
+#[cfg(test)]
+const CKM_RSA_PKCS: u64 = 0x0000_0001;
+#[cfg(test)]
+const CKM_SHA256: u64 = 0x0000_0250;
 
-fn decode_attribute_value(tag: u32, data: &[u8]) -> AttributeValue {
+fn decode_attribute_payload(tag: u32, data: &[u8]) -> AttributePayload {
     if is_bool_attribute(tag) {
-        return AttributeValue::Boolean(read_bool(data));
+        return AttributePayload::Boolean(read_bool(data));
     }
 
     match tag {
         CKA_CLASS => read_u32(data)
-            .map(AttributeValue::ObjectKind)
-            .unwrap_or_else(|| AttributeValue::ByteString(data.to_vec())),
+            .map(AttributePayload::ObjectKind)
+            .unwrap_or_else(|| AttributePayload::ByteString(data.to_vec())),
         CKA_KEY_TYPE => read_u32(data)
-            .map(AttributeValue::KeyKind)
-            .unwrap_or_else(|| AttributeValue::ByteString(data.to_vec())),
+            .map(AttributePayload::KeyKind)
+            .unwrap_or_else(|| AttributePayload::ByteString(data.to_vec())),
         CKA_MODULUS_BITS | CKA_VALUE_LEN => read_u64(data)
-            .map(AttributeValue::Uint64)
-            .or_else(|| read_u32(data).map(|v| AttributeValue::Uint64(v as u64)))
-            .unwrap_or_else(|| AttributeValue::ByteString(data.to_vec())),
-        _ => AttributeValue::ByteString(data.to_vec()),
+            .map(AttributePayload::Uint64)
+            .or_else(|| read_u32(data).map(|v| AttributePayload::Uint64(v as u64)))
+            .unwrap_or_else(|| AttributePayload::ByteString(data.to_vec())),
+        _ => AttributePayload::ByteString(data.to_vec()),
     }
 }
 
@@ -816,49 +1030,123 @@ fn read_u64(data: &[u8]) -> Option<u64> {
     }
 }
 
-/// Native PKCS#11 module state guarded by a mutex.
-struct NativePkcs11 {
-    module_path: Option<String>,
-    library: Option<libloading::Library>,
-    initialized: bool,
-}
+type HostMutexPrimitive = RawMutex;
 
-impl Default for NativePkcs11 {
-    fn default() -> Self {
-        Self {
-            module_path: None,
-            library: None,
-            initialized: false,
-        }
+unsafe fn host_mutex_from_ptr(ptr: *mut c_void) -> Option<&'static HostMutexPrimitive> {
+    if ptr.is_null() {
+        None
+    } else {
+        Some(&*(ptr as *mut HostMutexPrimitive))
     }
 }
 
+unsafe extern "C" fn create_host_mutex(mutex: *mut *mut c_void) -> ffi::CK_RV {
+    if mutex.is_null() {
+        return ffi::CKR_ARGUMENTS_BAD;
+    }
+    let raw = Box::new(HostMutexPrimitive::INIT);
+    *mutex = Box::into_raw(raw) as *mut c_void;
+    ffi::CKR_OK
+}
+
+unsafe extern "C" fn destroy_host_mutex(mutex: *mut c_void) -> ffi::CK_RV {
+    if mutex.is_null() {
+        return ffi::CKR_ARGUMENTS_BAD;
+    }
+    drop(Box::from_raw(mutex as *mut HostMutexPrimitive));
+    ffi::CKR_OK
+}
+
+unsafe extern "C" fn lock_host_mutex(mutex: *mut c_void) -> ffi::CK_RV {
+    if let Some(raw) = host_mutex_from_ptr(mutex) {
+        raw.lock();
+        ffi::CKR_OK
+    } else {
+        ffi::CKR_ARGUMENTS_BAD
+    }
+}
+
+unsafe extern "C" fn unlock_host_mutex(mutex: *mut c_void) -> ffi::CK_RV {
+    if let Some(raw) = host_mutex_from_ptr(mutex) {
+        unsafe { raw.unlock() };
+        ffi::CKR_OK
+    } else {
+        ffi::CKR_ARGUMENTS_BAD
+    }
+}
+
+/// Native PKCS#11 module state guarded by a mutex.
+struct NativePkcs11 {
+    loader: Arc<dyn ModuleLoader>,
+    module: Option<loader::ModuleHandle>,
+    initialized: bool,
+    preferred_slot: Option<u32>,
+}
+
 impl NativePkcs11 {
+    fn new(loader: Arc<dyn ModuleLoader>) -> Self {
+        Self {
+            loader,
+            module: None,
+            initialized: false,
+            preferred_slot: None,
+        }
+    }
+
+    fn current_config(&self) -> Option<String> {
+        self.module.as_ref().map(|handle| handle.config.raw.clone())
+    }
+
+    fn config_summary(&self) -> Option<AdapterConfigSummary> {
+        self.module
+            .as_ref()
+            .map(|handle| AdapterConfigSummary::from_loader(&handle.config, self.preferred_slot))
+    }
+
+    fn module_library(&self) -> Result<&libloading::Library, ErrorCode> {
+        self.module
+            .as_ref()
+            .map(|handle| &handle.library)
+            .ok_or(ErrorCode::CryptokiNotInitialized)
+    }
+
     fn library(&self) -> Result<&libloading::Library, ErrorCode> {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)
+        self.module_library()
     }
 
-    fn load_module(&mut self, module_path: &Path) -> Result<(), ErrorCode> {
-        let requested = module_path
-            .to_str()
-            .ok_or(ErrorCode::GeneralError)?
-            .to_string();
-
-        let need_reload = match (&self.module_path, &self.library) {
-            (Some(current), Some(_)) => current != &requested,
-            _ => true,
+    fn load_module(&mut self, config: &str) -> Result<(), ErrorCode> {
+        let parsed = self.loader.parse(config).map_err(ErrorCode::from)?;
+        let preferred_slot = parsed
+            .slot_filter
+            .map(|slot| u32::try_from(slot).map_err(|_| ErrorCode::SlotIdInvalid))
+            .transpose()?;
+        let (must_reload, pref_changed) = match &self.module {
+            Some(handle) => (
+                handle.config.module_path != parsed.module_path,
+                handle.config.mutex_preference != parsed.mutex_preference,
+            ),
+            None => (true, true),
         };
+        let slot_changed = self.preferred_slot != preferred_slot;
 
-        if need_reload {
-            let lib = unsafe { libloading::Library::new(module_path) }
-                .map_err(|_| ErrorCode::DeviceError)?;
-            self.library = Some(lib);
-            self.module_path = Some(requested);
-            self.initialized = false;
+        if self.initialized && (must_reload || pref_changed || slot_changed) {
+            self.finalize()?;
         }
+
+        if must_reload {
+            let handle = self.loader.load(&parsed).map_err(ErrorCode::from)?;
+            self.module = Some(handle);
+            self.initialized = false;
+        } else if let Some(current) = self.module.as_mut() {
+            current.config = parsed;
+            if pref_changed {
+                self.initialized = false;
+            }
+        }
+        self.preferred_slot = preferred_slot;
 
         Ok(())
     }
@@ -868,7 +1156,12 @@ impl NativePkcs11 {
             return Ok(());
         }
 
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let pref = self
+            .module
+            .as_ref()
+            .map(|handle| handle.config.mutex_preference)
+            .unwrap_or_default();
+        let lib = self.module_library()?;
 
         unsafe {
             let c_initialize: libloading::Symbol<
@@ -876,7 +1169,21 @@ impl NativePkcs11 {
             > = lib
                 .get(b"C_Initialize\0")
                 .map_err(|_| ErrorCode::FunctionFailed)?;
-            let rv = c_initialize(std::ptr::null());
+            let mut init_args = ffi::CK_C_INITIALIZE_ARGS::default();
+            let args_ptr = match pref {
+                MutexPreference::Auto | MutexPreference::OsThreads => {
+                    init_args.flags = ffi::CKF_OS_LOCKING_OK;
+                    &mut init_args as *mut _ as *const c_void
+                }
+                MutexPreference::None => {
+                    init_args.create_mutex = Some(create_host_mutex);
+                    init_args.destroy_mutex = Some(destroy_host_mutex);
+                    init_args.lock_mutex = Some(lock_host_mutex);
+                    init_args.unlock_mutex = Some(unlock_host_mutex);
+                    &mut init_args as *mut _ as *const c_void
+                }
+            };
+            let rv = c_initialize(args_ptr);
             if rv != ffi::CKR_OK {
                 return Err(rv_to_error(rv));
             }
@@ -890,7 +1197,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Ok(());
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.module_library()?;
         unsafe {
             let c_finalize: libloading::Symbol<unsafe extern "C" fn(*const c_void) -> ffi::CK_RV> =
                 lib.get(b"C_Finalize\0")
@@ -905,10 +1212,7 @@ impl NativePkcs11 {
     }
 
     fn get_slot_list(&self, token_present: bool) -> Result<Vec<u32>, ErrorCode> {
-        if !self.initialized {
-            return Err(ErrorCode::CryptokiNotInitialized);
-        }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_get_slot_list: libloading::Symbol<
@@ -948,7 +1252,15 @@ impl NativePkcs11 {
                 }
                 result.push(slot as u32);
             }
-            Ok(result)
+            if let Some(preferred) = self.preferred_slot {
+                if result.contains(&preferred) {
+                    Ok(vec![preferred])
+                } else {
+                    Err(ErrorCode::SlotIdInvalid)
+                }
+            } else {
+                Ok(result)
+            }
         }
     }
 
@@ -956,7 +1268,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_get_info: libloading::Symbol<
@@ -980,10 +1292,11 @@ impl NativePkcs11 {
     }
 
     fn get_slot_info(&self, slot: u32) -> Result<SlotInfo, ErrorCode> {
+        self.ensure_slot_allowed(slot)?;
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_get_slot_info: libloading::Symbol<
@@ -1007,10 +1320,11 @@ impl NativePkcs11 {
     }
 
     fn get_token_info(&self, slot: u32) -> Result<TokenInfo, ErrorCode> {
+        self.ensure_slot_allowed(slot)?;
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_get_token_info: libloading::Symbol<
@@ -1047,11 +1361,51 @@ impl NativePkcs11 {
         }
     }
 
-    fn get_mechanism_list(&self, slot: u32) -> Result<Vec<MechanismType>, ErrorCode> {
+    fn wait_for_slot_event(
+        &mut self,
+        flags: slot_manager::WaitFlags,
+    ) -> Result<slot_manager::SlotEvent, ErrorCode> {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.module_library()?;
+
+        unsafe {
+            let c_wait_for_slot_event: libloading::Symbol<
+                unsafe extern "C" fn(
+                    ffi::CK_FLAGS,
+                    *mut ffi::CK_SLOT_ID,
+                    *mut c_void,
+                ) -> ffi::CK_RV,
+            > = lib
+                .get(b"C_WaitForSlotEvent\0")
+                .map_err(|_| ErrorCode::FunctionFailed)?;
+            let mut slot_id: ffi::CK_SLOT_ID = ffi::CK_INVALID_HANDLE;
+            let rv = c_wait_for_slot_event(
+                wait_flags_to_ck(flags),
+                &mut slot_id as *mut _,
+                std::ptr::null_mut(),
+            );
+            if rv != ffi::CKR_OK {
+                return Err(rv_to_error(rv));
+            }
+            let slot = u32::try_from(slot_id).map_err(|_| ErrorCode::SlotIdInvalid)?;
+            self.ensure_slot_allowed(slot)?;
+            let info = self.get_slot_info(slot)?;
+            let token_present = info.slot_flags.contains(SlotFlags::TOKEN_PRESENT);
+            Ok(slot_manager::SlotEvent {
+                slot,
+                token_present,
+            })
+        }
+    }
+
+    fn get_mechanism_list(&self, slot: u32) -> Result<Vec<MechanismType>, ErrorCode> {
+        self.ensure_slot_allowed(slot)?;
+        if !self.initialized {
+            return Err(ErrorCode::CryptokiNotInitialized);
+        }
+        let lib = self.library()?;
 
         unsafe {
             let c_get_mechanism_list: libloading::Symbol<
@@ -1086,15 +1440,113 @@ impl NativePkcs11 {
         }
     }
 
+    fn get_operation_state(&self, handle: u32, max_size: u32) -> Result<OutputBuffer, ErrorCode> {
+        if !self.initialized {
+            return Err(ErrorCode::CryptokiNotInitialized);
+        }
+        let lib = self.library()?;
+
+        unsafe {
+            let c_get_operation_state: libloading::Symbol<
+                unsafe extern "C" fn(
+                    ffi::CK_SESSION_HANDLE,
+                    *mut ffi::CK_BYTE,
+                    *mut ffi::CK_ULONG,
+                ) -> ffi::CK_RV,
+            > = load_symbol(lib, b"C_GetOperationState\0")?;
+            let mut required: ffi::CK_ULONG = 0;
+            let rv = c_get_operation_state(
+                handle as ffi::CK_SESSION_HANDLE,
+                ptr::null_mut(),
+                &mut required,
+            );
+            if rv != ffi::CKR_OK {
+                return Err(rv_to_error(rv));
+            }
+
+            let mut buffer = vec![0u8; required as usize];
+            let mut actual = required;
+            let rv = c_get_operation_state(
+                handle as ffi::CK_SESSION_HANDLE,
+                buffer.as_mut_ptr(),
+                &mut actual,
+            );
+            if rv != ffi::CKR_OK {
+                return Err(rv_to_error(rv));
+            }
+
+            buffer.truncate(actual as usize);
+            let mut truncated = false;
+            if (max_size as u64) < actual as u64 {
+                truncated = true;
+                buffer.truncate(max_size as usize);
+            }
+
+            Ok(OutputBuffer {
+                data: buffer,
+                truncated,
+            })
+        }
+    }
+
+    fn set_operation_state(
+        &mut self,
+        handle: u32,
+        state: &[u8],
+        encryption_key: Option<u32>,
+        auth_key: Option<u32>,
+    ) -> Result<(), ErrorCode> {
+        if !self.initialized {
+            return Err(ErrorCode::CryptokiNotInitialized);
+        }
+        let lib = self.library()?;
+
+        unsafe {
+            let c_set_operation_state: libloading::Symbol<
+                unsafe extern "C" fn(
+                    ffi::CK_SESSION_HANDLE,
+                    *const ffi::CK_BYTE,
+                    ffi::CK_ULONG,
+                    ffi::CK_OBJECT_HANDLE,
+                    ffi::CK_OBJECT_HANDLE,
+                ) -> ffi::CK_RV,
+            > = load_symbol(lib, b"C_SetOperationState\0")?;
+            let len = to_ck_ulong(state.len())?;
+            let (ptr, len) = if state.is_empty() {
+                (ptr::null(), 0)
+            } else {
+                (state.as_ptr(), len)
+            };
+            let enc_handle = encryption_key
+                .map(|h| h as ffi::CK_OBJECT_HANDLE)
+                .unwrap_or(ffi::CK_INVALID_HANDLE);
+            let auth_handle = auth_key
+                .map(|h| h as ffi::CK_OBJECT_HANDLE)
+                .unwrap_or(ffi::CK_INVALID_HANDLE);
+            let rv = c_set_operation_state(
+                handle as ffi::CK_SESSION_HANDLE,
+                ptr,
+                len,
+                enc_handle,
+                auth_handle,
+            );
+            if rv != ffi::CKR_OK {
+                return Err(rv_to_error(rv));
+            }
+            Ok(())
+        }
+    }
+
     fn get_mechanism_info(
         &self,
         slot: u32,
         mechanism: MechanismType,
     ) -> Result<MechanismInfo, ErrorCode> {
+        self.ensure_slot_allowed(slot)?;
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_get_mechanism_info: libloading::Symbol<
@@ -1126,13 +1578,14 @@ impl NativePkcs11 {
     fn init_token(
         &mut self,
         slot: u32,
-        so_pin: Option<String>,
+        so_pin: Option<&[u8]>,
         label: String,
     ) -> Result<(), ErrorCode> {
+        self.ensure_slot_allowed(slot)?;
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_init_token: libloading::Symbol<
@@ -1146,10 +1599,9 @@ impl NativePkcs11 {
                 .get(b"C_InitToken\0")
                 .map_err(|_| ErrorCode::FunctionFailed)?;
 
-            let pin_bytes = so_pin.as_ref().map(|pin| pin.as_bytes());
-            let (pin_ptr, pin_len) = match pin_bytes {
-                Some(bytes) => (bytes.as_ptr(), bytes.len() as ffi::CK_ULONG),
-                None => (std::ptr::null(), 0),
+            let (pin_ptr, pin_len) = match so_pin {
+                Some(bytes) if !bytes.is_empty() => (bytes.as_ptr(), bytes.len() as ffi::CK_ULONG),
+                _ => (std::ptr::null(), 0),
             };
 
             let mut label_buf = [b' '; ffi::TOKEN_LABEL_LEN];
@@ -1171,10 +1623,11 @@ impl NativePkcs11 {
     }
 
     fn close_all_sessions(&mut self, slot: u32) -> Result<(), ErrorCode> {
+        self.ensure_slot_allowed(slot)?;
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_close_all_sessions: libloading::Symbol<
@@ -1194,7 +1647,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_login: libloading::Symbol<
@@ -1231,7 +1684,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_login: libloading::Symbol<
@@ -1268,7 +1721,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_logout: libloading::Symbol<
@@ -1288,7 +1741,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_init_pin: libloading::Symbol<
@@ -1317,7 +1770,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_set_pin: libloading::Symbol<
@@ -1359,7 +1812,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_cancel_function: libloading::Symbol<
@@ -1379,7 +1832,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_seed_random: libloading::Symbol<
@@ -1408,7 +1861,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_generate_random: libloading::Symbol<
@@ -1433,12 +1886,21 @@ impl NativePkcs11 {
         }
     }
 
+    fn ensure_slot_allowed(&self, slot: u32) -> Result<(), ErrorCode> {
+        if let Some(preferred) = self.preferred_slot {
+            if preferred != slot {
+                return Err(ErrorCode::SlotIdInvalid);
+            }
+        }
+        Ok(())
+    }
+
     fn create_object(&mut self, handle: u32, template: &[WitAttribute]) -> Result<u32, ErrorCode> {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
         let mut attrs = AttributeList::from_template(template)?;
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_create_object: libloading::Symbol<
@@ -1475,7 +1937,7 @@ impl NativePkcs11 {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
         let mut attrs = AttributeList::from_template(template)?;
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_copy_object: libloading::Symbol<
@@ -1508,7 +1970,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_destroy_object: libloading::Symbol<
@@ -1537,7 +1999,7 @@ impl NativePkcs11 {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
         let mut attrs = AttributeList::from_template(template)?;
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_set_attribute_value: libloading::Symbol<
@@ -1572,7 +2034,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_get_attribute_value: libloading::Symbol<
@@ -1630,16 +2092,29 @@ impl NativePkcs11 {
 
             let mut result = Vec::with_capacity(attrs.len());
             for (idx, attr) in attrs.iter().enumerate() {
-                let length = attr.ul_value_len as usize;
-                let bytes = if length == 0 {
+                let raw_len = attr.ul_value_len;
+                let length = raw_len as usize;
+                let bytes = if length == 0 || buffers[idx].is_empty() {
                     Vec::new()
                 } else {
                     buffers[idx][..length.min(buffers[idx].len())].to_vec()
                 };
-                let value = decode_attribute_value(tags[idx], &bytes);
+                let payload = decode_attribute_payload(tags[idx], &bytes);
+                let buffer_len = buffers[idx].len();
+                let partial =
+                    (buffer_len > 0 && length > buffer_len) || (buffer_len == 0 && length > 0);
+                let length_hint = if raw_len == ffi::CK_UNAVAILABLE_INFORMATION {
+                    None
+                } else {
+                    Some(raw_len as u64)
+                };
                 result.push(WitAttribute {
                     tag: tags[idx],
-                    value,
+                    value: AttributeValue {
+                        payload,
+                        length_hint,
+                        partial,
+                    },
                 });
             }
 
@@ -1656,7 +2131,7 @@ impl NativePkcs11 {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
         let mut attrs = AttributeList::from_template(template)?;
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_find_objects_init: libloading::Symbol<
@@ -1684,7 +2159,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_find_objects: libloading::Symbol<
@@ -1719,7 +2194,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_find_objects_final: libloading::Symbol<
@@ -2229,6 +2704,9 @@ impl NativePkcs11 {
     }
 
     fn digest_key(&mut self, handle: u32, key: u32) -> Result<(), ErrorCode> {
+        if !self.initialized {
+            return Err(ErrorCode::CryptokiNotInitialized);
+        }
         let lib = self.library()?;
 
         unsafe {
@@ -2243,6 +2721,234 @@ impl NativePkcs11 {
                 return Err(rv_to_error(rv));
             }
             Ok(())
+        }
+    }
+
+    fn generate_key(
+        &mut self,
+        handle: u32,
+        mechanism: &Mechanism,
+        template: &[WitAttribute],
+    ) -> Result<u32, ErrorCode> {
+        if !self.initialized {
+            return Err(ErrorCode::CryptokiNotInitialized);
+        }
+        let mut attrs = AttributeList::from_template(template)?;
+        let lib = self.library()?;
+
+        unsafe {
+            let mut mech = MechanismHolder::new(mechanism);
+            let c_generate_key: libloading::Symbol<
+                unsafe extern "C" fn(
+                    ffi::CK_SESSION_HANDLE,
+                    *mut ffi::CK_MECHANISM,
+                    *mut ffi::CK_ATTRIBUTE,
+                    ffi::CK_ULONG,
+                    *mut ffi::CK_OBJECT_HANDLE,
+                ) -> ffi::CK_RV,
+            > = load_symbol(lib, b"C_GenerateKey\0")?;
+            let mut object = 0;
+            let rv = c_generate_key(
+                handle as ffi::CK_SESSION_HANDLE,
+                mech.as_mut_ptr(),
+                attrs.attrs.as_mut_ptr(),
+                attrs.attrs.len() as ffi::CK_ULONG,
+                &mut object,
+            );
+            if rv != ffi::CKR_OK {
+                return Err(rv_to_error(rv));
+            }
+            Ok(object as u32)
+        }
+    }
+
+    fn generate_key_pair(
+        &mut self,
+        handle: u32,
+        mechanism: &Mechanism,
+        public_template: &[WitAttribute],
+        private_template: &[WitAttribute],
+    ) -> Result<(u32, u32), ErrorCode> {
+        if !self.initialized {
+            return Err(ErrorCode::CryptokiNotInitialized);
+        }
+        let mut public_attrs = AttributeList::from_template(public_template)?;
+        let mut private_attrs = AttributeList::from_template(private_template)?;
+        let lib = self.library()?;
+
+        unsafe {
+            let mut mech = MechanismHolder::new(mechanism);
+            let c_generate_key_pair: libloading::Symbol<
+                unsafe extern "C" fn(
+                    ffi::CK_SESSION_HANDLE,
+                    *mut ffi::CK_MECHANISM,
+                    *mut ffi::CK_ATTRIBUTE,
+                    ffi::CK_ULONG,
+                    *mut ffi::CK_ATTRIBUTE,
+                    ffi::CK_ULONG,
+                    *mut ffi::CK_OBJECT_HANDLE,
+                    *mut ffi::CK_OBJECT_HANDLE,
+                ) -> ffi::CK_RV,
+            > = load_symbol(lib, b"C_GenerateKeyPair\0")?;
+            let mut public_handle = 0;
+            let mut private_handle = 0;
+            let rv = c_generate_key_pair(
+                handle as ffi::CK_SESSION_HANDLE,
+                mech.as_mut_ptr(),
+                public_attrs.attrs.as_mut_ptr(),
+                public_attrs.attrs.len() as ffi::CK_ULONG,
+                private_attrs.attrs.as_mut_ptr(),
+                private_attrs.attrs.len() as ffi::CK_ULONG,
+                &mut public_handle,
+                &mut private_handle,
+            );
+            if rv != ffi::CKR_OK {
+                return Err(rv_to_error(rv));
+            }
+            Ok((public_handle as u32, private_handle as u32))
+        }
+    }
+
+    fn derive_key(
+        &mut self,
+        handle: u32,
+        base_key: u32,
+        mechanism: &Mechanism,
+        template: &[WitAttribute],
+    ) -> Result<u32, ErrorCode> {
+        if !self.initialized {
+            return Err(ErrorCode::CryptokiNotInitialized);
+        }
+        let mut attrs = AttributeList::from_template(template)?;
+        let lib = self.library()?;
+
+        unsafe {
+            let mut mech = MechanismHolder::new(mechanism);
+            let c_derive_key: libloading::Symbol<
+                unsafe extern "C" fn(
+                    ffi::CK_SESSION_HANDLE,
+                    *mut ffi::CK_MECHANISM,
+                    ffi::CK_OBJECT_HANDLE,
+                    *mut ffi::CK_ATTRIBUTE,
+                    ffi::CK_ULONG,
+                    *mut ffi::CK_OBJECT_HANDLE,
+                ) -> ffi::CK_RV,
+            > = load_symbol(lib, b"C_DeriveKey\0")?;
+            let mut new_handle = 0;
+            let rv = c_derive_key(
+                handle as ffi::CK_SESSION_HANDLE,
+                mech.as_mut_ptr(),
+                base_key as ffi::CK_OBJECT_HANDLE,
+                attrs.attrs.as_mut_ptr(),
+                attrs.attrs.len() as ffi::CK_ULONG,
+                &mut new_handle,
+            );
+            if rv != ffi::CKR_OK {
+                return Err(rv_to_error(rv));
+            }
+            Ok(new_handle as u32)
+        }
+    }
+
+    fn wrap_key(
+        &self,
+        handle: u32,
+        mechanism: &Mechanism,
+        wrapping_key: u32,
+        key: u32,
+    ) -> Result<Vec<u8>, ErrorCode> {
+        if !self.initialized {
+            return Err(ErrorCode::CryptokiNotInitialized);
+        }
+        let lib = self.library()?;
+
+        unsafe {
+            let mut mech = MechanismHolder::new(mechanism);
+            let c_wrap_key: libloading::Symbol<
+                unsafe extern "C" fn(
+                    ffi::CK_SESSION_HANDLE,
+                    *mut ffi::CK_MECHANISM,
+                    ffi::CK_OBJECT_HANDLE,
+                    ffi::CK_OBJECT_HANDLE,
+                    *mut ffi::CK_BYTE,
+                    *mut ffi::CK_ULONG,
+                ) -> ffi::CK_RV,
+            > = load_symbol(lib, b"C_WrapKey\0")?;
+            let mut required: ffi::CK_ULONG = 0;
+            let rv = c_wrap_key(
+                handle as ffi::CK_SESSION_HANDLE,
+                mech.as_mut_ptr(),
+                wrapping_key as ffi::CK_OBJECT_HANDLE,
+                key as ffi::CK_OBJECT_HANDLE,
+                ptr::null_mut(),
+                &mut required,
+            );
+            if rv != ffi::CKR_OK {
+                return Err(rv_to_error(rv));
+            }
+
+            let mut buffer = vec![0u8; required as usize];
+            let mut actual = required;
+            let rv = c_wrap_key(
+                handle as ffi::CK_SESSION_HANDLE,
+                mech.as_mut_ptr(),
+                wrapping_key as ffi::CK_OBJECT_HANDLE,
+                key as ffi::CK_OBJECT_HANDLE,
+                buffer.as_mut_ptr(),
+                &mut actual,
+            );
+            if rv != ffi::CKR_OK {
+                return Err(rv_to_error(rv));
+            }
+            buffer.truncate(actual as usize);
+            Ok(buffer)
+        }
+    }
+
+    fn unwrap_key(
+        &mut self,
+        handle: u32,
+        mechanism: &Mechanism,
+        wrapping_key: u32,
+        wrapped_key: &[u8],
+        template: &[WitAttribute],
+    ) -> Result<u32, ErrorCode> {
+        if !self.initialized {
+            return Err(ErrorCode::CryptokiNotInitialized);
+        }
+        let mut attrs = AttributeList::from_template(template)?;
+        let lib = self.library()?;
+
+        unsafe {
+            let mut mech = MechanismHolder::new(mechanism);
+            let c_unwrap_key: libloading::Symbol<
+                unsafe extern "C" fn(
+                    ffi::CK_SESSION_HANDLE,
+                    *mut ffi::CK_MECHANISM,
+                    ffi::CK_OBJECT_HANDLE,
+                    *const ffi::CK_BYTE,
+                    ffi::CK_ULONG,
+                    *mut ffi::CK_ATTRIBUTE,
+                    ffi::CK_ULONG,
+                    *mut ffi::CK_OBJECT_HANDLE,
+                ) -> ffi::CK_RV,
+            > = load_symbol(lib, b"C_UnwrapKey\0")?;
+            let len = to_ck_ulong(wrapped_key.len())?;
+            let mut object = 0;
+            let rv = c_unwrap_key(
+                handle as ffi::CK_SESSION_HANDLE,
+                mech.as_mut_ptr(),
+                wrapping_key as ffi::CK_OBJECT_HANDLE,
+                wrapped_key.as_ptr(),
+                len,
+                attrs.attrs.as_mut_ptr(),
+                attrs.attrs.len() as ffi::CK_ULONG,
+                &mut object,
+            );
+            if rv != ffi::CKR_OK {
+                return Err(rv_to_error(rv));
+            }
+            Ok(object as u32)
         }
     }
 
@@ -2300,62 +3006,7 @@ impl NativePkcs11 {
     }
 
     fn encrypt_update(&mut self, handle: u32, data: &[u8]) -> Result<Vec<u8>, ErrorCode> {
-        let lib = self.library()?;
-        let data_len = to_ck_ulong(data.len())?;
-
-        unsafe {
-            let c_encrypt_update: libloading::Symbol<
-                unsafe extern "C" fn(
-                    ffi::CK_SESSION_HANDLE,
-                    *const ffi::CK_BYTE,
-                    ffi::CK_ULONG,
-                    *mut ffi::CK_BYTE,
-                    *mut ffi::CK_ULONG,
-                ) -> ffi::CK_RV,
-            > = load_symbol(lib, b"C_EncryptUpdate\0")?;
-
-            let mut required_len: ffi::CK_ULONG = 0;
-            let rv = c_encrypt_update(
-                handle as ffi::CK_SESSION_HANDLE,
-                data.as_ptr(),
-                data_len,
-                ptr::null_mut(),
-                &mut required_len,
-            );
-            if rv != ffi::CKR_OK {
-                return Err(rv_to_error(rv));
-            }
-
-            let mut buffer = vec![0u8; required_len as usize];
-            let mut actual_len = required_len;
-            let mut rv = c_encrypt_update(
-                handle as ffi::CK_SESSION_HANDLE,
-                data.as_ptr(),
-                data_len,
-                if buffer.is_empty() {
-                    ptr::null_mut()
-                } else {
-                    buffer.as_mut_ptr()
-                },
-                &mut actual_len,
-            );
-            if rv == ffi::CKR_BUFFER_TOO_SMALL {
-                buffer.resize(actual_len as usize, 0);
-                rv = c_encrypt_update(
-                    handle as ffi::CK_SESSION_HANDLE,
-                    data.as_ptr(),
-                    data_len,
-                    buffer.as_mut_ptr(),
-                    &mut actual_len,
-                );
-            }
-            if rv != ffi::CKR_OK {
-                return Err(rv_to_error(rv));
-            }
-
-            buffer.truncate(actual_len as usize);
-            Ok(buffer)
-        }
+        self.update_with_symbol(handle, data, b"C_EncryptUpdate\0")
     }
 
     fn encrypt_final(&mut self, handle: u32, out_max: u32) -> Result<Vec<u8>, ErrorCode> {
@@ -2448,11 +3099,36 @@ impl NativePkcs11 {
     }
 
     fn decrypt_update(&mut self, handle: u32, data: &[u8]) -> Result<Vec<u8>, ErrorCode> {
+        self.update_with_symbol(handle, data, b"C_DecryptUpdate\0")
+    }
+
+    fn digest_encrypt_update(&mut self, handle: u32, data: &[u8]) -> Result<Vec<u8>, ErrorCode> {
+        self.update_with_symbol(handle, data, b"C_DigestEncryptUpdate\0")
+    }
+
+    fn decrypt_digest_update(&mut self, handle: u32, data: &[u8]) -> Result<Vec<u8>, ErrorCode> {
+        self.update_with_symbol(handle, data, b"C_DecryptDigestUpdate\0")
+    }
+
+    fn sign_encrypt_update(&mut self, handle: u32, data: &[u8]) -> Result<Vec<u8>, ErrorCode> {
+        self.update_with_symbol(handle, data, b"C_SignEncryptUpdate\0")
+    }
+
+    fn decrypt_verify_update(&mut self, handle: u32, data: &[u8]) -> Result<Vec<u8>, ErrorCode> {
+        self.update_with_symbol(handle, data, b"C_DecryptVerifyUpdate\0")
+    }
+
+    fn update_with_symbol(
+        &self,
+        handle: u32,
+        data: &[u8],
+        symbol: &[u8],
+    ) -> Result<Vec<u8>, ErrorCode> {
         let lib = self.library()?;
         let data_len = to_ck_ulong(data.len())?;
 
         unsafe {
-            let c_decrypt_update: libloading::Symbol<
+            let update_fn: libloading::Symbol<
                 unsafe extern "C" fn(
                     ffi::CK_SESSION_HANDLE,
                     *const ffi::CK_BYTE,
@@ -2460,10 +3136,10 @@ impl NativePkcs11 {
                     *mut ffi::CK_BYTE,
                     *mut ffi::CK_ULONG,
                 ) -> ffi::CK_RV,
-            > = load_symbol(lib, b"C_DecryptUpdate\0")?;
+            > = load_symbol(lib, symbol)?;
 
             let mut required_len: ffi::CK_ULONG = 0;
-            let rv = c_decrypt_update(
+            let rv = update_fn(
                 handle as ffi::CK_SESSION_HANDLE,
                 data.as_ptr(),
                 data_len,
@@ -2476,7 +3152,7 @@ impl NativePkcs11 {
 
             let mut buffer = vec![0u8; required_len as usize];
             let mut actual_len = required_len;
-            let mut rv = c_decrypt_update(
+            let mut rv = update_fn(
                 handle as ffi::CK_SESSION_HANDLE,
                 data.as_ptr(),
                 data_len,
@@ -2489,7 +3165,7 @@ impl NativePkcs11 {
             );
             if rv == ffi::CKR_BUFFER_TOO_SMALL {
                 buffer.resize(actual_len as usize, 0);
-                rv = c_decrypt_update(
+                rv = update_fn(
                     handle as ffi::CK_SESSION_HANDLE,
                     data.as_ptr(),
                     data_len,
@@ -2887,10 +3563,11 @@ impl NativePkcs11 {
     }
 
     fn open_session(&mut self, slot: u32, flags: WitSessionFlags) -> Result<u32, ErrorCode> {
+        self.ensure_slot_allowed(slot)?;
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_open_session: libloading::Symbol<
@@ -2924,7 +3601,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_close_session: libloading::Symbol<
@@ -2944,7 +3621,7 @@ impl NativePkcs11 {
         if !self.initialized {
             return Err(ErrorCode::CryptokiNotInitialized);
         }
-        let lib = self.library.as_ref().ok_or(ErrorCode::CryptokiNotInitialized)?;
+        let lib = self.library()?;
 
         unsafe {
             let c_get_session_info: libloading::Symbol<
@@ -2970,6 +3647,17 @@ impl NativePkcs11 {
     }
 }
 
+impl From<LoaderError> for ErrorCode {
+    fn from(err: LoaderError) -> Self {
+        match err {
+            LoaderError::MissingModule
+            | LoaderError::InvalidModule(_)
+            | LoaderError::OutsideAllowedRoots { .. } => ErrorCode::ArgumentsBad,
+            LoaderError::LoadFailure { .. } => ErrorCode::DeviceError,
+        }
+    }
+}
+
 /// Session resource implementation bridging to native PKCS#11 operations.
 pub struct SessionInner {
     ctx: AdapterContext,
@@ -2979,10 +3667,6 @@ pub struct SessionInner {
 impl SessionInner {
     pub fn new(ctx: AdapterContext, handle: u32) -> Self {
         Self { ctx, handle }
-    }
-
-    fn err(code: ErrorCode) -> ErrorCode {
-        code
     }
 
     fn credential_secret(credential: WitCredential) -> Result<Zeroizing<Vec<u8>>, ErrorCode> {
@@ -3132,6 +3816,22 @@ impl session_iface::GuestSession for SessionHost {
         self.with_inner(|inner| inner.digest(mechanism, data))
     }
 
+    fn digest_encrypt_update(&self, part: Chunk) -> Result<Vec<u8>, ErrorCode> {
+        self.with_inner(|inner| inner.digest_encrypt_update(part))
+    }
+
+    fn decrypt_digest_update(&self, part: Chunk) -> Result<Vec<u8>, ErrorCode> {
+        self.with_inner(|inner| inner.decrypt_digest_update(part))
+    }
+
+    fn sign_encrypt_update(&self, part: Chunk) -> Result<Vec<u8>, ErrorCode> {
+        self.with_inner(|inner| inner.sign_encrypt_update(part))
+    }
+
+    fn decrypt_verify_update(&self, part: Chunk) -> Result<Vec<u8>, ErrorCode> {
+        self.with_inner(|inner| inner.decrypt_verify_update(part))
+    }
+
     fn encrypt_init(
         &self,
         mechanism: Mechanism,
@@ -3269,18 +3969,19 @@ impl SessionInner {
 
     fn get_operation_state(
         &mut self,
-        _max_size: u32,
+        max_size: u32,
     ) -> Result<session_iface::OutputBuffer, ErrorCode> {
-        Err(Self::err(ErrorCode::FunctionFailed))
+        self.ctx.get_operation_state(self.handle, max_size)
     }
 
     fn set_operation_state(
         &mut self,
-        _state: Vec<u8>,
-        _encryption_key: Option<ObjectHandle>,
-        _auth_key: Option<ObjectHandle>,
+        state: Vec<u8>,
+        encryption_key: Option<ObjectHandle>,
+        auth_key: Option<ObjectHandle>,
     ) -> Result<(), ErrorCode> {
-        Err(Self::err(ErrorCode::FunctionFailed))
+        self.ctx
+            .set_operation_state(self.handle, &state, encryption_key, auth_key)
     }
 
     fn login(&mut self, kind: UserType, secret: WitCredential) -> Result<(), ErrorCode> {
@@ -3460,6 +4161,42 @@ impl SessionInner {
         Ok(digest)
     }
 
+    fn digest_encrypt_update(&mut self, part: Chunk) -> Result<Vec<u8>, ErrorCode> {
+        let data = part.data;
+        let result = {
+            let mut guard = self.ctx.inner.lock();
+            guard.digest_encrypt_update(self.handle, &data)
+        }?;
+        Ok(result)
+    }
+
+    fn decrypt_digest_update(&mut self, part: Chunk) -> Result<Vec<u8>, ErrorCode> {
+        let data = part.data;
+        let result = {
+            let mut guard = self.ctx.inner.lock();
+            guard.decrypt_digest_update(self.handle, &data)
+        }?;
+        Ok(result)
+    }
+
+    fn sign_encrypt_update(&mut self, part: Chunk) -> Result<Vec<u8>, ErrorCode> {
+        let data = part.data;
+        let result = {
+            let mut guard = self.ctx.inner.lock();
+            guard.sign_encrypt_update(self.handle, &data)
+        }?;
+        Ok(result)
+    }
+
+    fn decrypt_verify_update(&mut self, part: Chunk) -> Result<Vec<u8>, ErrorCode> {
+        let data = part.data;
+        let result = {
+            let mut guard = self.ctx.inner.lock();
+            guard.decrypt_verify_update(self.handle, &data)
+        }?;
+        Ok(result)
+    }
+
     fn encrypt_init(
         &mut self,
         mechanism: Mechanism,
@@ -3545,47 +4282,85 @@ impl SessionInner {
 
     fn generate_key(
         &mut self,
-        _mechanism: bindings::pkcs11::core::core::Mechanism,
-        _template: bindings::pkcs11::core::core::AttributeTemplate,
+        mechanism: bindings::pkcs11::core::core::Mechanism,
+        template: bindings::pkcs11::core::core::AttributeTemplate,
     ) -> Result<session_iface::Object, ErrorCode> {
-        Err(Self::err(ErrorCode::FunctionFailed))
+        let handle = self.ctx.generate_key(self.handle, &mechanism, &template)?;
+        Ok(session_iface::Object::new(ObjectHost::new(
+            self.ctx.clone(),
+            self.handle,
+            handle,
+        )))
     }
 
     fn generate_key_pair(
         &mut self,
-        _mechanism: bindings::pkcs11::core::core::Mechanism,
-        _public_template: bindings::pkcs11::core::core::AttributeTemplate,
-        _private_template: bindings::pkcs11::core::core::AttributeTemplate,
+        mechanism: bindings::pkcs11::core::core::Mechanism,
+        public_template: bindings::pkcs11::core::core::AttributeTemplate,
+        private_template: bindings::pkcs11::core::core::AttributeTemplate,
     ) -> Result<(session_iface::Object, session_iface::Object), ErrorCode> {
-        Err(Self::err(ErrorCode::FunctionFailed))
+        let (public, private) = self.ctx.generate_key_pair(
+            self.handle,
+            &mechanism,
+            &public_template,
+            &private_template,
+        )?;
+        let public_obj =
+            session_iface::Object::new(ObjectHost::new(self.ctx.clone(), self.handle, public));
+        let private_obj =
+            session_iface::Object::new(ObjectHost::new(self.ctx.clone(), self.handle, private));
+        Ok((public_obj, private_obj))
     }
 
     fn derive_key(
         &mut self,
-        _base_key: object_iface::ObjectBorrow<'_>,
-        _mechanism: bindings::pkcs11::core::core::Mechanism,
-        _template: bindings::pkcs11::core::core::AttributeTemplate,
+        base_key: object_iface::ObjectBorrow<'_>,
+        mechanism: bindings::pkcs11::core::core::Mechanism,
+        template: bindings::pkcs11::core::core::AttributeTemplate,
     ) -> Result<session_iface::Object, ErrorCode> {
-        Err(Self::err(ErrorCode::FunctionFailed))
+        let base = base_key.get::<ObjectHost>().handle();
+        let handle = self
+            .ctx
+            .derive_key(self.handle, base, &mechanism, &template)?;
+        Ok(session_iface::Object::new(ObjectHost::new(
+            self.ctx.clone(),
+            self.handle,
+            handle,
+        )))
     }
 
     fn wrap_key(
         &mut self,
-        _mechanism: bindings::pkcs11::core::core::Mechanism,
-        _wrapping_key: object_iface::ObjectBorrow<'_>,
-        _key: object_iface::ObjectBorrow<'_>,
+        mechanism: bindings::pkcs11::core::core::Mechanism,
+        wrapping_key: object_iface::ObjectBorrow<'_>,
+        key: object_iface::ObjectBorrow<'_>,
     ) -> Result<Vec<u8>, ErrorCode> {
-        Err(Self::err(ErrorCode::FunctionFailed))
+        let wrapping_handle = wrapping_key.get::<ObjectHost>().handle();
+        let target_handle = key.get::<ObjectHost>().handle();
+        self.ctx
+            .wrap_key(self.handle, &mechanism, wrapping_handle, target_handle)
     }
 
     fn unwrap_key(
         &mut self,
-        _mechanism: bindings::pkcs11::core::core::Mechanism,
-        _wrapping_key: object_iface::ObjectBorrow<'_>,
-        _wrapped_key: Vec<u8>,
-        _template: bindings::pkcs11::core::core::AttributeTemplate,
+        mechanism: bindings::pkcs11::core::core::Mechanism,
+        wrapping_key: object_iface::ObjectBorrow<'_>,
+        wrapped_key: Vec<u8>,
+        template: bindings::pkcs11::core::core::AttributeTemplate,
     ) -> Result<session_iface::Object, ErrorCode> {
-        Err(Self::err(ErrorCode::FunctionFailed))
+        let wrapping_handle = wrapping_key.get::<ObjectHost>().handle();
+        let handle = self.ctx.unwrap_key(
+            self.handle,
+            &mechanism,
+            wrapping_handle,
+            &wrapped_key,
+            &template,
+        )?;
+        Ok(session_iface::Object::new(ObjectHost::new(
+            self.ctx.clone(),
+            self.handle,
+            handle,
+        )))
     }
 
     fn seed_random(&mut self, seed: Vec<u8>) -> Result<(), ErrorCode> {
@@ -4198,18 +4973,17 @@ impl crypto_iface::Guest for Pkcs11Component {
 
 /// Slot manager implementation bridging WIT calls to native PKCS#11.
 impl Pkcs11Component {
-    fn parse_module_path(config: Option<String>) -> Option<String> {
-        config.map(|cfg| {
-            if let Some(rest) = cfg.strip_prefix("module=") {
-                rest.trim().to_string()
-            } else {
-                cfg.trim().to_string()
-            }
-        })
-    }
-
     fn ctx() -> AdapterContext {
         adapter()
+    }
+
+    fn env_config() -> Option<String> {
+        let loader = FilesystemLoader::default();
+        env::var("SOFTHSM_LIB")
+            .or_else(|_| env::var("PKCS11_MODULE_PATH"))
+            .ok()
+            .and_then(|path| loader.parse(&path).ok())
+            .map(|cfg| cfg.raw)
     }
 }
 
@@ -4220,10 +4994,14 @@ impl slot_manager::Guest for Pkcs11Component {
 
     fn initialize(config: Option<String>) -> Result<(), ErrorCode> {
         let ctx = Self::ctx();
-        let path = Self::parse_module_path(config)
-            .or_else(|| ctx.inner.lock().module_path.clone())
-            .ok_or(ErrorCode::GeneralError)?;
-        ctx.ensure_initialized(&path)
+        let incoming = config
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty());
+        let spec = incoming
+            .or_else(|| ctx.current_config())
+            .or_else(|| Self::env_config())
+            .ok_or(ErrorCode::ArgumentsBad)?;
+        ctx.ensure_initialized(&spec)
     }
 
     fn finalize() -> Result<(), ErrorCode> {
@@ -4247,9 +5025,9 @@ impl slot_manager::Guest for Pkcs11Component {
     }
 
     fn wait_for_slot_event(
-        _flags: slot_manager::WaitFlags,
+        flags: slot_manager::WaitFlags,
     ) -> Result<slot_manager::SlotEvent, ErrorCode> {
-        Err(ErrorCode::FunctionFailed)
+        Self::ctx().wait_for_slot_event(flags)
     }
 
     fn close_all_sessions(slot: u32) -> Result<(), ErrorCode> {
@@ -4280,6 +5058,10 @@ mod ffi {
 
     pub type CK_RV = u64;
     pub const CKR_OK: CK_RV = 0;
+    pub const CKR_GENERAL_ERROR: CK_RV = 0x0000_0005;
+    pub const CKR_ARGUMENTS_BAD: CK_RV = 0x0000_0007;
+    pub const CKR_NO_EVENT: CK_RV = 0x0000_0008;
+    pub const CKR_FUNCTION_NOT_SUPPORTED: CK_RV = 0x0000_0054;
     pub const CKR_BUFFER_TOO_SMALL: CK_RV = 0x0000_0150;
 
     pub type CK_ULONG = u64;
@@ -4294,6 +5076,11 @@ mod ffi {
     pub type CK_BYTE = u8;
     pub type CK_OBJECT_HANDLE = u64;
     pub type CK_ATTRIBUTE_TYPE = u64;
+    pub const CK_INVALID_HANDLE: CK_OBJECT_HANDLE = 0;
+    pub type CK_CREATEMUTEX = Option<unsafe extern "C" fn(*mut *mut c_void) -> CK_RV>;
+    pub type CK_DESTROYMUTEX = Option<unsafe extern "C" fn(*mut c_void) -> CK_RV>;
+    pub type CK_LOCKMUTEX = Option<unsafe extern "C" fn(*mut c_void) -> CK_RV>;
+    pub type CK_UNLOCKMUTEX = Option<unsafe extern "C" fn(*mut c_void) -> CK_RV>;
 
     pub const TOKEN_LABEL_LEN: usize = 32;
     pub const CK_UNAVAILABLE_INFORMATION: CK_ULONG = !0;
@@ -4343,6 +5130,8 @@ mod ffi {
     pub const CKF_UNWRAP: CK_FLAGS = 0x0000_0800;
     pub const CKF_DERIVE: CK_FLAGS = 0x0000_1000;
     pub const CKF_EXTENSION: CK_FLAGS = 0x8000_0000;
+    pub const CKF_OS_LOCKING_OK: CK_FLAGS = 0x0000_0002;
+    pub const CKF_DONT_BLOCK: CK_FLAGS = 0x0000_0001;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -4501,11 +5290,38 @@ mod ffi {
         pub p_value: *mut c_void,
         pub ul_value_len: CK_ULONG,
     }
+
+    #[repr(C)]
+    pub struct CK_C_INITIALIZE_ARGS {
+        pub create_mutex: CK_CREATEMUTEX,
+        pub destroy_mutex: CK_DESTROYMUTEX,
+        pub lock_mutex: CK_LOCKMUTEX,
+        pub unlock_mutex: CK_UNLOCKMUTEX,
+        pub flags: CK_FLAGS,
+        pub p_reserved: *mut c_void,
+    }
+
+    impl Default for CK_C_INITIALIZE_ARGS {
+        fn default() -> Self {
+            Self {
+                create_mutex: None,
+                destroy_mutex: None,
+                lock_mutex: None,
+                unlock_mutex: None,
+                flags: 0,
+                p_reserved: std::ptr::null_mut(),
+            }
+        }
+    }
 }
 
 fn rv_to_error(rv: ffi::CK_RV) -> ErrorCode {
     match rv {
         ffi::CKR_OK => ErrorCode::Ok,
+        ffi::CKR_GENERAL_ERROR => ErrorCode::GeneralError,
+        ffi::CKR_ARGUMENTS_BAD => ErrorCode::ArgumentsBad,
+        ffi::CKR_NO_EVENT => ErrorCode::NoEvent,
+        ffi::CKR_FUNCTION_NOT_SUPPORTED => ErrorCode::FunctionNotSupported,
         0x0000_000A => ErrorCode::SlotIdInvalid,
         0x0000_000B => ErrorCode::TokenNotPresent,
         0x0000_000E => ErrorCode::TokenWriteProtected,
@@ -4521,16 +5337,27 @@ fn rv_to_error(rv: ffi::CK_RV) -> ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::exports::pkcs11::token::slot_manager;
     use crate::bindings::exports::pkcs11::token::slot_manager::Guest as _;
-    use crate::{ObjectHost, SessionHost};
+    use crate::{
+        bindings::exports::pkcs11::crypto::crypto::GuestDigester, ObjectHost, SessionHost,
+    };
     use std::{
         env,
         error::Error,
+        path::Path,
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     fn module_path() -> Option<String> {
-        env::var("PKCS11_MODULE_PATH").ok()
+        env::var("SOFTHSM_LIB")
+            .or_else(|_| env::var("PKCS11_MODULE_PATH"))
+            .ok()
+    }
+
+    fn config_string(module: &str) -> String {
+        format!("module={module},mutex=os")
     }
 
     fn map_code<T>(context: &str, result: Result<T, ErrorCode>) -> Result<T, Box<dyn Error>> {
@@ -4542,14 +5369,23 @@ mod tests {
         let module = match module_path() {
             Some(path) => path,
             None => {
-                eprintln!("Skipping pkcs11_integration_smoke: PKCS11_MODULE_PATH not set");
+                eprintln!(
+                    "Skipping pkcs11_integration_smoke: set SOFTHSM_LIB or PKCS11_MODULE_PATH"
+                );
                 return Ok(());
             }
         };
 
+        if !Path::new(&module).exists() {
+            eprintln!(
+                "Skipping pkcs11_integration_smoke: module path {module} does not exist on this host"
+            );
+            return Ok(());
+        }
+
         map_code(
             "initialize",
-            Pkcs11Component::initialize(Some(format!("module={module}"))),
+            Pkcs11Component::initialize(Some(config_string(&module))),
         )?;
 
         let test_result: Result<(), Box<dyn Error>> = (|| {
@@ -4622,19 +5458,23 @@ mod tests {
                 let template: AttributeTemplate = vec![
                     WitAttribute {
                         tag: CKA_CLASS,
-                        value: AttributeValue::Uint32(CKO_DATA),
+                        value: attribute_value_from_payload(AttributePayload::Uint32(CKO_DATA)),
                     },
                     WitAttribute {
                         tag: CKA_TOKEN,
-                        value: AttributeValue::Boolean(false),
+                        value: attribute_value_from_payload(AttributePayload::Boolean(false)),
                     },
                     WitAttribute {
                         tag: CKA_LABEL,
-                        value: AttributeValue::ByteString(label.clone().into_bytes()),
+                        value: attribute_value_from_payload(AttributePayload::ByteString(
+                            label.clone().into_bytes(),
+                        )),
                     },
                     WitAttribute {
                         tag: CKA_VALUE,
-                        value: AttributeValue::ByteString(test_data.clone()),
+                        value: attribute_value_from_payload(AttributePayload::ByteString(
+                            test_data.clone(),
+                        )),
                     },
                 ];
 
@@ -4654,10 +5494,111 @@ mod tests {
                     object_host.with_inner(|inner| inner.destroy()),
                 )?;
 
+                let rsa_id = vec![0xA5, 0x5A];
+                let key_label = format!("{label}-rsa");
+                let rsa_keygen = Mechanism {
+                    kind: CKM_RSA_PKCS_KEY_PAIR_GEN,
+                    parameter: None,
+                };
+                let (public_key, private_key) = map_code(
+                    "session.generate_key_pair",
+                    session_host.with_inner(|inner| {
+                        inner.generate_key_pair(
+                            rsa_keygen.clone(),
+                            rsa_public_template(&key_label, &rsa_id),
+                            rsa_private_template(&key_label, &rsa_id),
+                        )
+                    }),
+                )?;
+                let public_host = public_key.get::<ObjectHost>();
+                let private_host = private_key.get::<ObjectHost>();
+
+                let rsa_mechanism = Mechanism {
+                    kind: CKM_RSA_PKCS,
+                    parameter: None,
+                };
+                let recover_payload = b"rsa-recover-payload".to_vec();
+                let recovered = map_code(
+                    "session.sign_recover",
+                    session_host.with_inner(|inner| {
+                        inner.ctx.sign_recover(
+                            inner.handle,
+                            &rsa_mechanism,
+                            private_host.handle(),
+                            &recover_payload,
+                            4096,
+                        )
+                    }),
+                )?;
+                assert!(
+                    !recovered.truncated,
+                    "sign_recover should not truncate recoverable data"
+                );
+                assert_eq!(
+                    recovered.data, recover_payload,
+                    "sign_recover returned original payload"
+                );
+
+                let verified = map_code(
+                    "session.verify_recover",
+                    session_host.with_inner(|inner| {
+                        inner.ctx.verify_recover(
+                            inner.handle,
+                            &rsa_mechanism,
+                            public_host.handle(),
+                            &recovered.data,
+                            4096,
+                        )
+                    }),
+                )?;
+                assert!(
+                    !verified.truncated,
+                    "verify_recover should not truncate recoverable data"
+                );
+                assert_eq!(
+                    verified.data, recover_payload,
+                    "verify_recover returned original payload"
+                );
+
+                let digest_mechanism = Mechanism {
+                    kind: CKM_SHA256,
+                    parameter: None,
+                };
+                let digester = map_code(
+                    "session.digest_init",
+                    session_host.with_inner(|inner| inner.digest_init(digest_mechanism.clone())),
+                )?;
+                let digester_host = digester.get::<DigesterHost>();
+                map_code(
+                    "session.digest_key",
+                    session_host.with_inner(|inner| {
+                        inner.ctx.digest_key(inner.handle, private_host.handle())
+                    }),
+                )?;
+                let digest = map_code("digester.final", digester_host.final_())?;
+                assert_eq!(
+                    digest.len(),
+                    32,
+                    "SHA-256 digest over the private key should be 32 bytes"
+                );
+
+                map_code(
+                    "public.destroy",
+                    public_host.with_inner(|inner| inner.destroy()),
+                )?;
+                map_code(
+                    "private.destroy",
+                    private_host.with_inner(|inner| inner.destroy()),
+                )?;
+
                 map_code(
                     "session.logout",
                     session_host.with_inner(|inner| inner.logout()),
                 )?;
+            }
+
+            if let Some(mech) = parse_mechanism_env("PKCS11_STATE_MECH") {
+                exercise_state_serialization(&session_host, mech)?;
             }
 
             map_code(
@@ -4679,6 +5620,191 @@ mod tests {
             (Err(test_err), _) => Err(test_err),
             (_, Err(finalize_err)) => Err(finalize_err),
             (Ok(_), Ok(_)) => Ok(()),
+        }
+    }
+
+    #[test]
+    fn env_config_uses_canonical_form() {
+        let original = env::var("PKCS11_MODULE_PATH").ok();
+        env::set_var("PKCS11_MODULE_PATH", "/tmp/libpkcs11-test.so");
+        env::remove_var("SOFTHSM_LIB");
+        let config = Pkcs11Component::env_config().expect("env config to parse");
+        assert_eq!(config, "module=/tmp/libpkcs11-test.so");
+        match original {
+            Some(val) => env::set_var("PKCS11_MODULE_PATH", val),
+            None => env::remove_var("PKCS11_MODULE_PATH"),
+        }
+    }
+
+    #[test]
+    fn slot_filter_enforces_selected_slot() {
+        let loader: Arc<dyn ModuleLoader> = Arc::new(FilesystemLoader::default());
+        let mut native = NativePkcs11::new(loader);
+        native.preferred_slot = Some(42);
+        assert!(native.ensure_slot_allowed(42).is_ok());
+        let err = native.ensure_slot_allowed(7).unwrap_err();
+        assert!(matches!(err, ErrorCode::SlotIdInvalid));
+    }
+
+    #[test]
+    fn wait_flags_to_ck_sets_dont_block() {
+        let empty = slot_manager::WaitFlags::empty();
+        assert_eq!(wait_flags_to_ck(empty), 0);
+        let mut flags = slot_manager::WaitFlags::empty();
+        flags |= slot_manager::WaitFlags::DONT_BLOCK;
+        assert_eq!(wait_flags_to_ck(flags), ffi::CKF_DONT_BLOCK);
+    }
+
+    fn rsa_public_template(label: &str, id: &[u8]) -> AttributeTemplate {
+        vec![
+            WitAttribute {
+                tag: CKA_CLASS,
+                value: attribute_value_from_payload(AttributePayload::Uint32(CKO_PUBLIC_KEY)),
+            },
+            WitAttribute {
+                tag: CKA_TOKEN,
+                value: attribute_value_from_payload(AttributePayload::Boolean(false)),
+            },
+            WitAttribute {
+                tag: CKA_LABEL,
+                value: attribute_value_from_payload(AttributePayload::ByteString(
+                    label.as_bytes().to_vec(),
+                )),
+            },
+            WitAttribute {
+                tag: CKA_ID,
+                value: attribute_value_from_payload(AttributePayload::ByteString(id.to_vec())),
+            },
+            WitAttribute {
+                tag: CKA_KEY_TYPE,
+                value: attribute_value_from_payload(AttributePayload::Uint32(CKK_RSA)),
+            },
+            WitAttribute {
+                tag: CKA_MODULUS_BITS,
+                value: attribute_value_from_payload(AttributePayload::Uint32(2048)),
+            },
+            WitAttribute {
+                tag: CKA_PUBLIC_EXPONENT,
+                value: attribute_value_from_payload(AttributePayload::ByteString(vec![1, 0, 1])),
+            },
+            WitAttribute {
+                tag: CKA_VERIFY,
+                value: attribute_value_from_payload(AttributePayload::Boolean(true)),
+            },
+            WitAttribute {
+                tag: CKA_VERIFY_RECOVER,
+                value: attribute_value_from_payload(AttributePayload::Boolean(true)),
+            },
+        ]
+    }
+
+    fn rsa_private_template(label: &str, id: &[u8]) -> AttributeTemplate {
+        vec![
+            WitAttribute {
+                tag: CKA_CLASS,
+                value: attribute_value_from_payload(AttributePayload::Uint32(CKO_PRIVATE_KEY)),
+            },
+            WitAttribute {
+                tag: CKA_TOKEN,
+                value: attribute_value_from_payload(AttributePayload::Boolean(false)),
+            },
+            WitAttribute {
+                tag: CKA_LABEL,
+                value: attribute_value_from_payload(AttributePayload::ByteString(
+                    label.as_bytes().to_vec(),
+                )),
+            },
+            WitAttribute {
+                tag: CKA_ID,
+                value: attribute_value_from_payload(AttributePayload::ByteString(id.to_vec())),
+            },
+            WitAttribute {
+                tag: CKA_KEY_TYPE,
+                value: attribute_value_from_payload(AttributePayload::Uint32(CKK_RSA)),
+            },
+            WitAttribute {
+                tag: CKA_PRIVATE,
+                value: attribute_value_from_payload(AttributePayload::Boolean(true)),
+            },
+            WitAttribute {
+                tag: CKA_SENSITIVE,
+                value: attribute_value_from_payload(AttributePayload::Boolean(false)),
+            },
+            WitAttribute {
+                tag: CKA_EXTRACTABLE,
+                value: attribute_value_from_payload(AttributePayload::Boolean(true)),
+            },
+            WitAttribute {
+                tag: CKA_SIGN,
+                value: attribute_value_from_payload(AttributePayload::Boolean(true)),
+            },
+            WitAttribute {
+                tag: CKA_SIGN_RECOVER,
+                value: attribute_value_from_payload(AttributePayload::Boolean(true)),
+            },
+        ]
+    }
+
+    fn parse_mechanism_env(name: &str) -> Option<u64> {
+        let raw = env::var(name).ok()?;
+        if let Some(rest) = raw.strip_prefix("0x") {
+            u64::from_str_radix(rest, 16).ok()
+        } else if let Some(rest) = raw.strip_prefix("0X") {
+            u64::from_str_radix(rest, 16).ok()
+        } else {
+            raw.parse().ok()
+        }
+    }
+
+    fn exercise_state_serialization(
+        session_host: &SessionHost,
+        mechanism_kind: u64,
+    ) -> Result<(), String> {
+        let mechanism = Mechanism {
+            kind: mechanism_kind,
+            parameter: None,
+        };
+        let expected = {
+            let digester = session_host
+                .with_inner(|inner| inner.digest(mechanism.clone(), b"state-test-data".to_vec()))
+                .map_err(|e| format!("baseline digest failed: {:?}", e))?;
+            digester
+        };
+
+        let digester = session_host
+            .with_inner(|inner| inner.digest_init(mechanism.clone()))
+            .map_err(|e| format!("digest_init failed: {:?}", e))?;
+        let digester_host = digester.get::<DigesterHost>();
+        let chunk = Chunk {
+            data: b"state-test-data".to_vec(),
+            final_: false,
+        };
+        digester_host
+            .update(chunk)
+            .map_err(|e| format!("digest update failed: {:?}", e))?;
+
+        match session_host.with_inner(|inner| inner.get_operation_state(4096)) {
+            Ok(state) => {
+                session_host
+                    .with_inner(|inner| inner.set_operation_state(state.data.clone(), None, None))
+                    .map_err(|e| format!("set operation state failed: {:?}", e))?;
+                let mut chunk = Chunk {
+                    data: Vec::new(),
+                    final_: true,
+                };
+                chunk.data.extend_from_slice(b"");
+                digester_host
+                    .update(chunk.clone())
+                    .map_err(|e| format!("digest update final failed: {:?}", e))?;
+                let final_digest = digester_host
+                    .final_()
+                    .map_err(|e| format!("digest final failed: {:?}", e))?;
+                if final_digest != expected {
+                    return Err("operation state round trip mismatch".to_string());
+                }
+                Ok(())
+            }
+            Err(err) => Err(format!("get operation state not supported: {:?}", err)),
         }
     }
 }
