@@ -32,6 +32,7 @@ pub mod bindings {
     });
 }
 
+mod cloud;
 mod loader;
 
 use crate::loader::{FilesystemLoader, LoaderError, ModuleConfig, ModuleLoader, MutexPreference};
