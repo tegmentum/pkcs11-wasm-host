@@ -5,8 +5,7 @@ use libloading::Library;
 use thiserror::Error;
 
 /// Preference for how PKCS#11 mutex callbacks should be configured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MutexPreference {
     /// Let the adapter decide (defaults to OS-level locking).
     #[default]
@@ -16,7 +15,6 @@ pub enum MutexPreference {
     /// Application will serialize access; no OS locking flag is set.
     None,
 }
-
 
 /// Parsed module configuration derived from the slot-manager config string.
 #[derive(Debug, Clone)]

@@ -5134,14 +5134,11 @@ mod ffi {
     pub const CKF_DONT_BLOCK: CK_FLAGS = 0x0000_0001;
 
     #[repr(C)]
-    #[derive(Clone, Copy)]
-    #[derive(Default)]
+    #[derive(Clone, Copy, Default)]
     pub struct CK_VERSION {
         pub major: u8,
         pub minor: u8,
     }
-
-    
 
     #[repr(C)]
     #[derive(Default)]
@@ -5152,8 +5149,6 @@ mod ffi {
         pub library_description: [CK_UTF8CHAR; 32],
         pub library_version: CK_VERSION,
     }
-
-    
 
     #[repr(C)]
     pub struct CK_SLOT_INFO {
@@ -5230,8 +5225,6 @@ mod ffi {
         pub max_key_size: CK_ULONG,
         pub flags: CK_FLAGS,
     }
-
-    
 
     #[repr(C)]
     pub struct CK_MECHANISM {
@@ -5553,7 +5546,9 @@ mod tests {
                 map_code(
                     "session.digest_key",
                     session_host.with_inner(|inner| {
-                        inner.ctx.digest_key(inner.handle, private_host.get_handle())
+                        inner
+                            .ctx
+                            .digest_key(inner.handle, private_host.get_handle())
                     }),
                 )?;
                 let digest = map_code("digester.final", digester_host.final_())?;

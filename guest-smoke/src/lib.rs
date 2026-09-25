@@ -125,10 +125,7 @@ impl Guest for GuestComponent {
     fn run() -> GuestResult<()> {
         let module = module_path()?;
         let init_config = format!("module={module}");
-        GuestComponent::map(
-            "initialize",
-            slot_manager::initialize(Some(&init_config)),
-        )?;
+        GuestComponent::map("initialize", slot_manager::initialize(Some(&init_config)))?;
 
         let result = (|| {
             let slots = GuestComponent::map("get_slot_list", slot_manager::get_slot_list(false))?;
@@ -196,10 +193,8 @@ impl Guest for GuestComponent {
                     },
                 ];
 
-                let object = GuestComponent::map(
-                    "session.create_object",
-                    session.create_object(&template),
-                )?;
+                let object =
+                    GuestComponent::map("session.create_object", session.create_object(&template))?;
                 let size = GuestComponent::map("object.get_size", object.get_size())?;
                 if size != data.len() as u64 {
                     return Err("object size mismatch".into());
@@ -216,11 +211,7 @@ impl Guest for GuestComponent {
                 let private_template = rsa_private_template(&rsa_label, &rsa_id);
                 let (public_key, private_key) = GuestComponent::map(
                     "session.generate_key_pair",
-                    session.generate_key_pair(
-                        &rsa_keygen,
-                        &public_template,
-                        &private_template,
-                    ),
+                    session.generate_key_pair(&rsa_keygen, &public_template, &private_template),
                 )?;
 
                 let rsa_mechanism = Mechanism {
@@ -230,12 +221,7 @@ impl Guest for GuestComponent {
                 let recover_payload = b"guest-rsa-recover".to_vec();
                 let recovered = GuestComponent::map(
                     "session.sign_recover",
-                    session.sign_recover(
-                        &rsa_mechanism,
-                        &private_key,
-                        &recover_payload,
-                        4096,
-                    ),
+                    session.sign_recover(&rsa_mechanism, &private_key, &recover_payload, 4096),
                 )?;
                 if recovered.truncated || recovered.data != recover_payload {
                     return Err("sign_recover mismatch".into());
@@ -243,12 +229,7 @@ impl Guest for GuestComponent {
 
                 let verified = GuestComponent::map(
                     "session.verify_recover",
-                    session.verify_recover(
-                        &rsa_mechanism,
-                        &public_key,
-                        &recovered.data,
-                        4096,
-                    ),
+                    session.verify_recover(&rsa_mechanism, &public_key, &recovered.data, 4096),
                 )?;
                 if verified.truncated || verified.data != recover_payload {
                     return Err("verify_recover mismatch".into());
@@ -260,10 +241,7 @@ impl Guest for GuestComponent {
                 };
                 let digester =
                     GuestComponent::map("session.digest_init", session.digest_init(&digest_mech))?;
-                GuestComponent::map(
-                    "session.digest_key",
-                    session.digest_key(&private_key),
-                )?;
+                GuestComponent::map("session.digest_key", session.digest_key(&private_key))?;
                 let digest = GuestComponent::map("digester.final", digester.final_())?;
                 if digest.len() != 32 {
                     return Err("digest_key produced unexpected length".into());
