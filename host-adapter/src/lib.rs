@@ -7,7 +7,6 @@ use std::ptr;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use libloading;
 use log::info;
 use parking_lot::lock_api::RawMutex as _;
 use parking_lot::{Mutex, RawMutex};
@@ -748,7 +747,7 @@ fn ck_ulong_option(value: ffi::CK_ULONG) -> Option<u64> {
     if value == ffi::CK_UNAVAILABLE_INFORMATION {
         None
     } else {
-        Some(value as u64)
+        Some(value)
     }
 }
 
@@ -1345,12 +1344,12 @@ impl NativePkcs11 {
                 model: trim_ck_utf8(&info.model),
                 serial_number: trim_ck_utf8(&info.serial_number),
                 token_flags: token_flags_from_ck(info.flags),
-                max_session_count: info.max_session_count as u64,
-                session_count: info.session_count as u64,
-                max_rw_session_count: info.max_rw_session_count as u64,
-                rw_session_count: info.rw_session_count as u64,
-                max_pin_len: info.max_pin_len as u64,
-                min_pin_len: info.min_pin_len as u64,
+                max_session_count: info.max_session_count,
+                session_count: info.session_count,
+                max_rw_session_count: info.max_rw_session_count,
+                rw_session_count: info.rw_session_count,
+                max_pin_len: info.max_pin_len,
+                min_pin_len: info.min_pin_len,
                 total_public_memory: ck_ulong_option(info.total_public_memory),
                 free_public_memory: ck_ulong_option(info.free_public_memory),
                 total_private_memory: ck_ulong_option(info.total_private_memory),
@@ -1569,8 +1568,8 @@ impl NativePkcs11 {
                 return Err(rv_to_error(rv));
             }
             Ok(MechanismInfo {
-                min_key_size: info.min_key_size as u64,
-                max_key_size: info.max_key_size as u64,
+                min_key_size: info.min_key_size,
+                max_key_size: info.max_key_size,
                 mechanism_flags: mechanism_flags_from_ck(info.flags),
             })
         }
@@ -2107,7 +2106,7 @@ impl NativePkcs11 {
                 let length_hint = if raw_len == ffi::CK_UNAVAILABLE_INFORMATION {
                     None
                 } else {
-                    Some(raw_len as u64)
+                    Some(raw_len)
                 };
                 result.push(WitAttribute {
                     tag: tags[idx],
@@ -3642,7 +3641,7 @@ impl NativePkcs11 {
                 slot: info.slot_id as u32,
                 state: session_state_from_ck(info.state),
                 session_flags: session_flags_from_ck(info.flags),
-                device_error: info.device_error as u64,
+                device_error: info.device_error,
             })
         }
     }
@@ -5000,7 +4999,7 @@ impl slot_manager::Guest for Pkcs11Component {
             .filter(|raw| !raw.is_empty());
         let spec = incoming
             .or_else(|| ctx.current_config())
-            .or_else(|| Self::env_config())
+            .or_else(Self::env_config)
             .ok_or(ErrorCode::ArgumentsBad)?;
         ctx.ensure_initialized(&spec)
     }
@@ -5136,18 +5135,16 @@ mod ffi {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
+    #[derive(Default)]
     pub struct CK_VERSION {
         pub major: u8,
         pub minor: u8,
     }
 
-    impl Default for CK_VERSION {
-        fn default() -> Self {
-            Self { major: 0, minor: 0 }
-        }
-    }
+    
 
     #[repr(C)]
+    #[derive(Default)]
     pub struct CK_INFO {
         pub cryptoki_version: CK_VERSION,
         pub manufacturer_id: [CK_UTF8CHAR; 32],
@@ -5156,17 +5153,7 @@ mod ffi {
         pub library_version: CK_VERSION,
     }
 
-    impl Default for CK_INFO {
-        fn default() -> Self {
-            Self {
-                cryptoki_version: CK_VERSION::default(),
-                manufacturer_id: [0; 32],
-                flags: 0,
-                library_description: [0; 32],
-                library_version: CK_VERSION::default(),
-            }
-        }
-    }
+    
 
     #[repr(C)]
     pub struct CK_SLOT_INFO {
@@ -5237,21 +5224,14 @@ mod ffi {
     }
 
     #[repr(C)]
+    #[derive(Default)]
     pub struct CK_MECHANISM_INFO {
         pub min_key_size: CK_ULONG,
         pub max_key_size: CK_ULONG,
         pub flags: CK_FLAGS,
     }
 
-    impl Default for CK_MECHANISM_INFO {
-        fn default() -> Self {
-            Self {
-                min_key_size: 0,
-                max_key_size: 0,
-                flags: 0,
-            }
-        }
-    }
+    
 
     #[repr(C)]
     pub struct CK_MECHANISM {
@@ -5599,7 +5579,7 @@ mod tests {
             }
 
             if let Some(mech) = parse_mechanism_env("PKCS11_STATE_MECH") {
-                exercise_state_serialization(&session_host, mech)?;
+                exercise_state_serialization(session_host, mech)?;
             }
 
             map_code(

@@ -82,12 +82,8 @@ impl CloudModuleClient for MockCloudClient {
         Ok(())
     }
 
-    fn slot_list(&self, token_present: bool) -> Result<Vec<u32>, CloudLoaderError> {
-        if token_present {
-            Ok(self.slots.clone())
-        } else {
-            Ok(self.slots.clone())
-        }
+    fn slot_list(&self, _token_present: bool) -> Result<Vec<u32>, CloudLoaderError> {
+        Ok(self.slots.clone())
     }
 
     fn module_info(&self) -> Result<CloudModuleInfo, CloudLoaderError> {

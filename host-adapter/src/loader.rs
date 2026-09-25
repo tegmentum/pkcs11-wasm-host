@@ -6,8 +6,10 @@ use thiserror::Error;
 
 /// Preference for how PKCS#11 mutex callbacks should be configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum MutexPreference {
     /// Let the adapter decide (defaults to OS-level locking).
+    #[default]
     Auto,
     /// Explicitly request the token's OS-level locking support.
     OsThreads,
@@ -15,11 +17,6 @@ pub enum MutexPreference {
     None,
 }
 
-impl Default for MutexPreference {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 /// Parsed module configuration derived from the slot-manager config string.
 #[derive(Debug, Clone)]
@@ -31,7 +28,7 @@ pub struct ModuleConfig {
 }
 
 impl ModuleConfig {
-    fn canonical_string(path: &PathBuf, pref: MutexPreference, slot: Option<u64>) -> String {
+    fn canonical_string(path: &Path, pref: MutexPreference, slot: Option<u64>) -> String {
         let mut parts = vec![format!("module={}", path.display())];
         if let Some(entry) = match pref {
             MutexPreference::Auto => None,
@@ -215,6 +212,36 @@ impl ModuleLoader for FilesystemLoader {
     }
 }
 
+fn to_absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn canonicalize_path(path: &Path) -> PathBuf {
+    match path.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            if let Some(parent) = path.parent() {
+                let base = parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf());
+                if let Some(name) = path.file_name() {
+                    base.join(name)
+                } else {
+                    base
+                }
+            } else {
+                path.to_path_buf()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,35 +301,5 @@ mod tests {
             .parse(&format!("module={}", path.display()))
             .expect("path inside root");
         assert!(cfg.raw.contains(&base.display().to_string()));
-    }
-}
-
-fn to_absolute(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else if let Ok(cwd) = env::current_dir() {
-        cwd.join(path)
-    } else {
-        path.to_path_buf()
-    }
-}
-
-fn canonicalize_path(path: &Path) -> PathBuf {
-    match path.canonicalize() {
-        Ok(resolved) => resolved,
-        Err(_) => {
-            if let Some(parent) = path.parent() {
-                let base = parent
-                    .canonicalize()
-                    .unwrap_or_else(|_| parent.to_path_buf());
-                if let Some(name) = path.file_name() {
-                    base.join(name)
-                } else {
-                    base
-                }
-            } else {
-                path.to_path_buf()
-            }
-        }
     }
 }
