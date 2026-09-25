@@ -26,6 +26,18 @@ The PKCS#11 component world relies on WIT resources to wrap native handles. This
 5. `object::destroy()` wraps `C_DestroyObject` and either consumes the resource or marks it invalid.
 6. Automatic drop on `object` invokes `C_DestroyObject` only when the resource was created transiently (e.g., generated key marked non-token). Persistent objects simply release the handle.
 
+## Attribute Metadata Hygiene
+1. Every attribute returned by `object::get-attributes` now carries a `length-hint` mirroring `ulValueLen`. Use this to decide if a follow-up `get-attributes` call should request a larger buffer or if the token returned `CK_UNAVAILABLE_INFORMATION`.
+2. The `partial` flag toggles when the host detects truncated data (e.g., SoftHSM reports `CKR_BUFFER_TOO_SMALL`). Callers should treat `partial = true` as a retry signal and include the latest `length-hint` when resizing.
+3. Templates you send to `create-object`/`set-attributes` can leave `length-hint` unset; the host adapter computes the byte width automatically. Always zeroize temporary buffers (labels, secrets) after populating the template.
+4. Certificate fetches should check `(tag = CKA_VALUE, partial = true)` and reissue the query with a `max-size` equal to `length-hint` before decoding DER blobs into the guest.
+
+## Credential Handling & Zeroization
+1. All session credential flows (`login`, `login_vendor`, `init_pin`, `set_pin`) wrap `credential::inline` payloads in `Zeroizing<Vec<u8>>` so the memory is scrubbed as soon as the PKCS#11 call completes.
+2. When the guest supplies a `pin-provider`, the adapter calls `provider.request_secret` to obtain the PIN, immediately invokes `pin-provider::clear`, and then forwards the zeroized buffer into the native driver.
+3. `slot-manager::init-token` now copies the supplied SO PIN into a `Zeroizing<Vec<u8>>` before invoking `C_InitToken`, ensuring SO credentials never linger in host memory regardless of success or failure.
+4. Hosts must avoid logging inline credentials; traces and debug logs include only slot/session identifiers and high-level status codes.
+
 ## Cryptographic Operations
 1. Stateless one-shot calls (`session::encrypt`, `session::decrypt`, `session::sign`, `session::verify`, `session::digest`) translate to corresponding `C_*` functions, using `pkcs11:core/mechanism` for parameters, while `session::generate-random` and `session::seed-random` wrap the token RNG APIs.
 2. Multi-part workflows expose dedicated resources:

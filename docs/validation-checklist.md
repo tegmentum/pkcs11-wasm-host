@@ -5,6 +5,9 @@ This checklist tracks the minimum scenarios the host adapter must pass against S
 ## Environment Prep
 - [ ] Install SoftHSM v2 and initialize a test token with SO/user PINs (`softhsm2-util --init-token`).
 - [ ] Configure the adapter with the SoftHSM module path via the slot-manager `initialize` config string.
+- [ ] Export `SOFTHSM_LIB=/path/to/libsofthsm2.so` (or `PKCS11_MODULE_PATH`) so both the host integration test and the `guest-smoke` component can discover the provider automatically.
+- [ ] Optionally add `slot=<id>` to the initialization config when you want to pin tests to a specific slot; mismatched slot usage will now return `slot-id-invalid` immediately.
+- [ ] Optional: set `PKCS11_STATE_MECH` (decimal or `0x...`) before running the host adapter tests or the `guest-smoke` component to exercise `C_GetOperationState`/`C_SetOperationState` on a mechanism SoftHSM supports; both harnesses skip state serialization if the module returns `CKR_FUNCTION_NOT_SUPPORTED`.
 
 ## Slot and Session Lifecycle
 - [ ] `get-slot-list(false)` returns both populated and empty slots, matching `softhsm2-util --show-slots`.
@@ -33,3 +36,15 @@ This checklist tracks the minimum scenarios the host adapter must pass against S
 ## Observability
 - [ ] Adapter logs include slot/session identifiers but never raw PINs or key material.
 - [ ] Metrics (if enabled) export counters for mechanism usage and error codes to aid debugging.
+
+## Troubleshooting & Error Mapping
+| Scenario | Expected `error-code` | Next action |
+| --- | --- | --- |
+| Token reports `CKR_BUFFER_TOO_SMALL` for `get-attributes` | `buffer-too-small` with returned `length-hint` | Reissue `object::get-attributes` using the hinted size; mark previous response as `partial = true`. |
+| Login denied due to wrong PIN | `pin-incorrect` | Retry only when the provider indicates more attempts remain; bubble to caller when `token-info.user-pin-final-try` is set. |
+| Mechanism mismatch (e.g., RSA key + GCM) | `mechanism-param-invalid` | Abort operation; require caller to supply a compatible template. |
+| Driver removes token mid-operation | `device-removed` | Cancel the pending operation, call `slot-manager::close-all-sessions`, and wait for reinsertion before retrying. |
+| Vendor module returns unknown code | `unknown(u32)` | Surface the numeric value and consult provider guide; avoid automatic retries until mapped. |
+| Token reports `CKR_PIN_LOCKED` | `pin-locked` | Stop retry attempts, require SO reset via `slot-manager::init-token`, and log the final try count. |
+| RNG refuses seeding (`CKR_RANDOM_SEED_NOT_SUPPORTED`) | `random-seed-not-supported` | Skip `seed-random` on this device and continue with `generate-random`; document limitation in provider guide. |
+| `wait-for-slot-event` called with `dont-block` and no events | `no-event` | Return immediately; caller should back off or switch to blocking mode before retrying. |

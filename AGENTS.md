@@ -1,46 +1,19 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `host-adapter/`: Rust crate that exposes the `pkcs11:world/pkcs11` WIT world to native PKCS#11 providers. Source lives in `src/`; generated bindings will land in `src/bindings.rs` once `wit-bindgen` runs.
-- `wit/`: Canonical WIT packages (`pkcs11-*`) plus `worlds/pkcs11.wit`, consumed via the `PKCS11_WIT_ROOT` env var during builds. Module-level APIs, slot/token metadata, and mechanism queries are defined in `pkcs11-core` and `pkcs11-token/slot-manager`.
-- `docs/`: Design notes, validation checklists, and planning artifacts that explain architecture and roadmap assumptions.
+The `host-adapter/` crate exposes the `pkcs11:world/pkcs11` WIT world; all Rust sources live in `host-adapter/src/` with generated bindings emitted to `src/bindings.rs` during `build.rs`. Canonical WIT packages reside in `wit/` and should be referenced through `PKCS11_WIT_ROOT=$(pwd)/wit` to avoid external drift. Design plans, validation matrices, and provider notes are captured under `docs/`, so align new features with the documented assumptions before coding.
 
 ## Build, Test, and Development Commands
-- `cargo build --manifest-path host-adapter/Cargo.toml`: Compile the adapter and trigger `build.rs` so bindings can be generated.
-- `PKCS11_WIT_ROOT=$(pwd)/wit cargo test --manifest-path host-adapter/Cargo.toml`: Execute unit and integration tests with the WIT root pointing at the local packages.
-- `cargo fmt && cargo clippy --all-targets --all-features`: Enforce formatting and linting before opening a review.
+`cargo build --manifest-path host-adapter/Cargo.toml` compiles the adapter and refreshes bindings. Run `PKCS11_WIT_ROOT=$(pwd)/wit cargo test --manifest-path host-adapter/Cargo.toml` for unit and integration coverage; keep the env var in place so tests load the in-tree WIT packages. Lint and formatting checks use `cargo fmt && cargo clippy --all-targets --all-features`, and must pass prior to opening a review.
 
 ## Coding Style & Naming Conventions
-- Rust code follows `rustfmt` defaults (4-space indent, snake_case identifiers, UpperCamelCase types). Keep WIT items kebab-case to match existing packages.
-- Prefer `anyhow::Result` for internal error paths and map to `pkcs11::core::ErrorCode` at the API surface.
-- Log sensitive operations at `debug` level; avoid logging token or credential material.
+Rust code follows default `rustfmt` (4-space indentation, snake_case identifiers, UpperCamelCase types). Model new error paths with `anyhow::Result` internally and translate to `pkcs11::core::ErrorCode` at the boundary. Keep WIT symbols kebab-case and route all PKCS#11 conversions through `host-adapter/src/lib.rs` so FFI structures stay centralized. Log sensitive operations at `debug` level only.
 
 ## Testing Guidelines
-- Add unit tests alongside implementations in `host-adapter/src/` using `#[cfg(test)]` modules.
-- Integration tests should spin up SoftHSM or a vendor module via the configuration string (`module=/path/to/libsofthsm2.so`). Guard hardware-dependent tests behind feature flags.
-- Aim for coverage of slot discovery, initialization/finalization flows, and error mapping from CK_RV codes to `ErrorCode` values.
-- Extend coverage to new module-level calls (`get-info`, `get-slot-info`, `get-token-info`, mechanism enumeration) so regressions in metadata translation are caught early.
-- Exercise session credential flows (SO/user login, PIN init/change), RNG usage, and object CRUD/search to verify the freshly wired PKCS#11 entry points.
-- Add multipart encrypt/decrypt/sign/verify/digest cases that iterate over `chunk` updates and confirm finalization/abort paths cleanly reset session state.
+Unit tests live next to their modules in `host-adapter/src/` using `#[cfg(test)]`; integration suites should launch SoftHSM or a vendor module via `module=/path/to/libsofthsm2.so`. Cover slot discovery, initialization/finalization, RNG, session credential flows, and object CRUD/search. Add multipart encrypt/decrypt/sign/verify/digest scenarios that exercise the `C_*Init/C_*Update/C_*Final` paths and confirm session cleanup. Feature-gate hardware-dependent suites and document any external modules in `docs/`.
 
 ## Commit & Pull Request Guidelines
-- Use imperative, present-tense commit subjects (`Add slot finalizer`). Include body context when touching unsafe code or FFI boundaries.
-- Reference tracking issues with `Refs #123` in the footer when applicable. Attach SoftHSM logs or screenshots for behavioral changes.
-- Pull requests should describe impacted modules, testing performed, and any external module versions used. Request a second reviewer when modifying `bindings` or `ffi` surfaces.
+Use imperative, present-tense commit subjects (e.g., “Add slot finalizer”) and include context for unsafe or FFI-heavy changes. Reference tracking issues with `Refs #123` when applicable and attach logs or screenshots for behavioral updates. Pull requests should summarize affected modules, list testing performed, note PKCS#11 providers or module versions, and seek a second reviewer when touching bindings or FFI layers.
 
 ## Security & Configuration Tips
-- Never commit real HSM credentials or vendor libraries; rely on local paths and `.gitignore` for secrets.
-- Validate that `PKCS11_WIT_ROOT` resolves to the checked-in `wit/` tree to avoid loading untrusted interface definitions.
-- Review third-party PKCS#11 modules in a sandboxed environment and document any additional system dependencies in `docs/`.
-
-## Provider Registry Usage
-- Register new provider modules through the exported `provider-registry` interface so guests can enumerate providers without hard-coded paths.
-- Use lowercase canonical names (e.g., `softhsm`) and absolute `module-path` values to avoid duplicate entries.
-- Update `docs/provider-guides/` whenever a new provider is registered to keep setup scripts aligned with registry metadata.
-
-## PKCS#11 Surface Coverage
-- The WIT world now exposes module introspection (`get-info`), token reinitialization (`init-token`), mechanism list/info queries, and bulk session teardown to mirror the core PKCS#11 general-purpose functions.
-- Mechanism, attribute, key-type, and object-class identifiers flow as numeric values (`CK_*`) to avoid gaps when new spec revisions ship.
-- When adding new bindings, keep conversions centralized in `host-adapter/src/lib.rs` so FFI structs and flag mappers remain authoritative.
-- Session resources now bridge login/logout, PIN lifecycle, RNG primitives, and object management/search onto the native driver; use these hooks rather than ad-hoc FFI wrappers.
-- Multipart streaming helpers (`encryptor`, `decryptor`, `signer`, `verifier`, `digester`) directly call `C_*Init/C_*Update/C_*Final`, so prefer them over manual session state management when contributing new flows.
+Never commit real HSM credentials or vendor binaries; point configurations at local paths and rely on `.gitignore`. Validate that `PKCS11_WIT_ROOT` resolves to the checked-in `wit/` tree before builds to prevent loading untrusted interfaces. Register providers through the `provider-registry` interface using lowercase canonical names and absolute module paths, and update `docs/provider-guides/` whenever registry metadata changes.

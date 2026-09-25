@@ -4,18 +4,19 @@ The initial host adapter will be implemented in Rust using the `wasmtime` compon
 
 ## Architecture
 - Slot manager `initialize`/`finalize`/`get-slot-list` now call directly into the native module; configuration accepts strings of the form `module=/path/to/pkcs11.so`.
-- **Loader**: resolves a PKCS#11 shared library path from configuration, loads it with `libloading`, and wires optional mutex callbacks when the provider signals legacy threading requirements.
+- **Loader**: resolves a PKCS#11 shared library path from configuration, loads it with `libloading`, and wires optional mutex callbacks when the provider signals legacy threading requirements. This logic now lives in `host-adapter/src/loader.rs` behind a `ModuleLoader` trait so alternative loaders (cloud adapters, sandboxed paths) can plug in without touching the PKCS#11 runtime. The config string currently accepts `module=/path/to/pkcs11.so`, `mutex=os|none`, and `slot=<id>` switches, enabling per-provider threading overrides and deterministic slot pinning without recompiling; `mutex=none` now activates host-managed `RawMutex` callbacks for drivers that expect application-level locking. When `PKCS11_MODULE_ROOTS` is set the filesystem loader rejects module paths outside that allowlist, giving sandboxed deployments a simple defense-in-depth toggle.
+- **Config summary & env fallback**: `AdapterContext::ensure_initialized` logs the canonicalized config (module path, mutex preference, slot filter) and `AdapterContext::config_summary()` exposes it programmatically. When no config string is provided the adapter falls back to the last known config or the `SOFTHSM_LIB`/`PKCS11_MODULE_PATH` environment variables, so automation can rely purely on env settings.
 - **Runtime bindings**: generated via `wit-bindgen` to obtain strongly typed shims for `pkcs11:world/pkcs11`. The adapter exports the slot manager interface and stores native handles inside Rust structs associated with WIT resources.
 - **Handle registry**: maintains maps from `slot-id`, `session-handle`, and `object-handle` to their native counterparts, ensuring deterministic drop by implementing `Drop`/`ResourceTable` hooks that call `C_CloseSession`, `C_DestroyObject`, etc.
 - **Error translation**: converts CKR_* constants into the `pkcs11:core/error-code` variant, with a fallback that records the raw numeric value for `vendor` or `unknown` cases.
 - **Mechanism encoding helpers**: leverage the new `pkcs11:crypto/mechanism-parameter` records to serialize mechanism structs into native `CK_MECHANISM` memory before invoking the driver.
-- **Module metadata**: `C_GetInfo`, `C_GetSlotInfo`, `C_GetTokenInfo`, `C_GetMechanismList`, and `C_GetMechanismInfo` are bridged through the slot manager so guests receive accurate module descriptors without vendor-specific shims.
-- **Session orchestration**: `SessionImpl` now wraps login/logout, PIN lifecycle, RNG seeding/generation, and object CRUD/search flows via `C_Login`, `C_InitPIN`, `C_SetPIN`, `C_SeedRandom`, `C_GenerateRandom`, and `C_{Create,Copy,Destroy,Find}Object`.
+- **Module metadata & slot events**: `C_GetInfo`, `C_GetSlotInfo`, `C_GetTokenInfo`, `C_GetMechanismList`, and `C_GetMechanismInfo` are bridged through the slot manager so guests receive accurate module descriptors without vendor-specific shims. `slot-manager::wait-for-slot-event` now calls `C_WaitForSlotEvent`, honors the `dont-block` flag by mapping it to `CKF_DONT_BLOCK`, and returns the latest `token-present` bit pulled from `C_GetSlotInfo`. When running in sandboxed environments, set `PKCS11_MODULE_ROOTS` so the filesystem loader only accepts modules from trusted directories; additional loaders (cloud, remote proxy) can implement the `ModuleLoader` trait to reach providers that live outside the local filesystem.
+- **Session orchestration**: `SessionImpl` now wraps login/logout, PIN lifecycle, RNG seeding/generation, object CRUD/search flows, and dual-purpose cryptography. Alongside the existing encrypt/decrypt/digest/sign streams we now forward `C_DigestEncryptUpdate`, `C_DecryptDigestUpdate`, `C_SignEncryptUpdate`, and `C_DecryptVerifyUpdate` so legacy modules that rely on combined state machines are supported without separate guest glue.
 - **Multipart crypto**: single-shot and streaming encrypt/decrypt/sign/verify/digest flows map onto `C_*Init/C_*Update/C_*Final` so Wasm guests can drive incremental operations using the WIT streaming resources.
 
 ## Credential & PIN Handling
-- **Inline credentials**: when the guest passes `credential::inline`, the adapter copies the buffer into a stack-allocated vector, zeroizes it after the PKCS#11 call with `zeroize::Zeroizing`, and rejects buffers larger than the token’s maximum PIN length.
-- **Provider-backed credentials**: prompts are delegated back into the guest via the `pin-provider` resource. The adapter tracks outstanding providers and ensures `pin-provider::clear` is called after each use.
+- **Inline credentials**: when the guest passes `credential::inline`, the adapter copies the buffer into a `Zeroizing<Vec<u8>>`, zeroizes it after the PKCS#11 call, and rejects buffers larger than the token’s maximum PIN length.
+- **Provider-backed credentials**: prompts are delegated back into the guest via the `pin-provider` resource. The adapter tracks outstanding providers and ensures `pin-provider::clear` is called after each use before issuing the native login call.
 - **Protected authentication path**: if the token advertises `token-flags::protected-authentication-path`, the adapter bypasses inline secrets and returns `error-code::pin-not-supported` unless the provider resource is used.
 - **Audit logging**: sensitive values are never logged; errors include only high-level status codes and slot identifiers.
 
@@ -30,7 +31,6 @@ The initial host adapter will be implemented in Rust using the `wasmtime` compon
 
 ## Open Tasks
 - Define binary serialization between `mechanism-parameter` and `mechanism.parameter` fields in `pkcs11:core/mechanism`.
-- Decide how to surface asynchronous provider interactions (e.g., waiting on `C_WaitForSlotEvent`) in the adapter runtime.
 - Explore caching policies for objects keyed by handle vs. re-querying attributes on each call.
 - Round out advanced flows such as `C_SignRecover{Init}`, `C_VerifyRecover{Init}`, `C_DigestKey`, and `C_GetObjectSize` to finish the PKCS#11 surface.
 ## Provider Integration Next Steps
