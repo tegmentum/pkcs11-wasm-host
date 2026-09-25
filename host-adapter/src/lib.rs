@@ -4036,7 +4036,7 @@ impl SessionInner {
         source: object_iface::ObjectBorrow<'_>,
         template: AttributeTemplate,
     ) -> Result<session_iface::Object, ErrorCode> {
-        let source_handle = source.get::<ObjectHost>().handle();
+        let source_handle = source.get::<ObjectHost>().get_handle();
         let handle = self
             .ctx
             .copy_object(self.handle, source_handle, &template)?;
@@ -4073,7 +4073,7 @@ impl SessionInner {
         plaintext: Vec<u8>,
         out_max: u32,
     ) -> Result<OutputBuffer, ErrorCode> {
-        let key_handle = key.get::<ObjectHost>().handle();
+        let key_handle = key.get::<ObjectHost>().get_handle();
         let result = {
             let mut guard = self.ctx.inner.lock();
             guard.encrypt(self.handle, &mechanism, key_handle, &plaintext, out_max)
@@ -4088,7 +4088,7 @@ impl SessionInner {
         ciphertext: Vec<u8>,
         out_max: u32,
     ) -> Result<OutputBuffer, ErrorCode> {
-        let key_handle = key.get::<ObjectHost>().handle();
+        let key_handle = key.get::<ObjectHost>().get_handle();
         let result = {
             let mut guard = self.ctx.inner.lock();
             guard.decrypt(self.handle, &mechanism, key_handle, &ciphertext, out_max)
@@ -4102,7 +4102,7 @@ impl SessionInner {
         key: object_iface::ObjectBorrow<'_>,
         message: Vec<u8>,
     ) -> Result<Vec<u8>, ErrorCode> {
-        let key_handle = key.get::<ObjectHost>().handle();
+        let key_handle = key.get::<ObjectHost>().get_handle();
         let signature = {
             let mut guard = self.ctx.inner.lock();
             guard.sign(self.handle, &mechanism, key_handle, &message)
@@ -4117,7 +4117,7 @@ impl SessionInner {
         message: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<(), ErrorCode> {
-        let key_handle = key.get::<ObjectHost>().handle();
+        let key_handle = key.get::<ObjectHost>().get_handle();
         {
             let mut guard = self.ctx.inner.lock();
             guard.verify(self.handle, &mechanism, key_handle, &message, &signature)
@@ -4131,7 +4131,7 @@ impl SessionInner {
         data: Vec<u8>,
         out_max: u32,
     ) -> Result<OutputBuffer, ErrorCode> {
-        let key_handle = key.get::<ObjectHost>().handle();
+        let key_handle = key.get::<ObjectHost>().get_handle();
         let result = {
             let mut guard = self.ctx.inner.lock();
             guard.sign_recover(self.handle, &mechanism, key_handle, &data, out_max)
@@ -4146,7 +4146,7 @@ impl SessionInner {
         signature: Vec<u8>,
         out_max: u32,
     ) -> Result<OutputBuffer, ErrorCode> {
-        let key_handle = key.get::<ObjectHost>().handle();
+        let key_handle = key.get::<ObjectHost>().get_handle();
         let result = {
             let mut guard = self.ctx.inner.lock();
             guard.verify_recover(self.handle, &mechanism, key_handle, &signature, out_max)
@@ -4203,7 +4203,7 @@ impl SessionInner {
         mechanism: Mechanism,
         key: object_iface::ObjectBorrow<'_>,
     ) -> Result<session_iface::Encryptor, ErrorCode> {
-        let key_handle = key.get::<ObjectHost>().handle();
+        let key_handle = key.get::<ObjectHost>().get_handle();
         {
             let mut guard = self.ctx.inner.lock();
             guard.encrypt_init(self.handle, &mechanism, key_handle)?;
@@ -4219,7 +4219,7 @@ impl SessionInner {
         mechanism: Mechanism,
         key: object_iface::ObjectBorrow<'_>,
     ) -> Result<session_iface::Decryptor, ErrorCode> {
-        let key_handle = key.get::<ObjectHost>().handle();
+        let key_handle = key.get::<ObjectHost>().get_handle();
         {
             let mut guard = self.ctx.inner.lock();
             guard.decrypt_init(self.handle, &mechanism, key_handle)?;
@@ -4235,7 +4235,7 @@ impl SessionInner {
         mechanism: Mechanism,
         key: object_iface::ObjectBorrow<'_>,
     ) -> Result<session_iface::Signer, ErrorCode> {
-        let key_handle = key.get::<ObjectHost>().handle();
+        let key_handle = key.get::<ObjectHost>().get_handle();
         {
             let mut guard = self.ctx.inner.lock();
             guard.sign_init(self.handle, &mechanism, key_handle)?;
@@ -4251,7 +4251,7 @@ impl SessionInner {
         mechanism: Mechanism,
         key: object_iface::ObjectBorrow<'_>,
     ) -> Result<session_iface::Verifier, ErrorCode> {
-        let key_handle = key.get::<ObjectHost>().handle();
+        let key_handle = key.get::<ObjectHost>().get_handle();
         {
             let mut guard = self.ctx.inner.lock();
             guard.verify_init(self.handle, &mechanism, key_handle)?;
@@ -4274,7 +4274,7 @@ impl SessionInner {
     }
 
     fn digest_key(&mut self, key: object_iface::ObjectBorrow<'_>) -> Result<(), ErrorCode> {
-        let key_handle = key.get::<ObjectHost>().handle();
+        let key_handle = key.get::<ObjectHost>().get_handle();
         {
             let mut guard = self.ctx.inner.lock();
             guard.digest_key(self.handle, key_handle)
@@ -4319,7 +4319,7 @@ impl SessionInner {
         mechanism: bindings::pkcs11::core::core::Mechanism,
         template: bindings::pkcs11::core::core::AttributeTemplate,
     ) -> Result<session_iface::Object, ErrorCode> {
-        let base = base_key.get::<ObjectHost>().handle();
+        let base = base_key.get::<ObjectHost>().get_handle();
         let handle = self
             .ctx
             .derive_key(self.handle, base, &mechanism, &template)?;
@@ -4336,8 +4336,8 @@ impl SessionInner {
         wrapping_key: object_iface::ObjectBorrow<'_>,
         key: object_iface::ObjectBorrow<'_>,
     ) -> Result<Vec<u8>, ErrorCode> {
-        let wrapping_handle = wrapping_key.get::<ObjectHost>().handle();
-        let target_handle = key.get::<ObjectHost>().handle();
+        let wrapping_handle = wrapping_key.get::<ObjectHost>().get_handle();
+        let target_handle = key.get::<ObjectHost>().get_handle();
         self.ctx
             .wrap_key(self.handle, &mechanism, wrapping_handle, target_handle)
     }
@@ -4349,7 +4349,7 @@ impl SessionInner {
         wrapped_key: Vec<u8>,
         template: bindings::pkcs11::core::core::AttributeTemplate,
     ) -> Result<session_iface::Object, ErrorCode> {
-        let wrapping_handle = wrapping_key.get::<ObjectHost>().handle();
+        let wrapping_handle = wrapping_key.get::<ObjectHost>().get_handle();
         let handle = self.ctx.unwrap_key(
             self.handle,
             &mechanism,
@@ -4438,7 +4438,7 @@ impl ObjectHost {
 }
 
 impl object_iface::GuestObject for ObjectHost {
-    fn handle(&self) -> u32 {
+    fn get_handle(&self) -> u32 {
         self.inner.lock().handle_raw()
     }
 
